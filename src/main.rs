@@ -23,43 +23,43 @@ const LOGO: &str = r"
 ";
 
 #[derive(Parser, Debug)]
-#[clap(version)]
-#[clap(group(
+#[command(version)]
+#[command(group(
     ArgGroup::new("auth")
         .required(true)
-        .args(&["no-auth", "users"]),
+        .args(["no_auth", "users"]),
 ), group(
     ArgGroup::new("log")
-        .args(&["verbosity", "quiet"]),
+        .args(["verbosity", "quiet"]),
 ))]
 struct Opt {
-    #[clap(short, long, default_value_t = 1080)]
+    #[arg(short, long, default_value_t = 1080)]
     /// Set port to listen on
     port: u16,
 
-    #[clap(short, long, default_value = "127.0.0.1")]
+    #[arg(short, long, default_value = "127.0.0.1")]
     /// Set ip to listen on
     ip: String,
 
-    #[clap(long)]
+    #[arg(long)]
     /// Allow insecure configuration
     allow_insecure: bool,
 
-    #[clap(long)]
+    #[arg(long)]
     /// Allow unauthenticated connections
     no_auth: bool,
 
-    #[clap(short, long)]
+    #[arg(short, long)]
     /// CSV File with username/password pairs
     users: Option<PathBuf>,
 
     /// Log verbosity level. -vv for more verbosity.
     /// Environmental variable `RUST_LOG` overrides this flag!
-    #[clap(short, parse(from_occurrences))]
+    #[arg(short, action = clap::ArgAction::Count)]
     verbosity: u8,
 
     /// Do not output any logs (even errors!). Overrides `RUST_LOG`
-    #[clap(short)]
+    #[arg(short)]
     quiet: bool,
 }
 
