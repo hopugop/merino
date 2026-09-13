@@ -11,7 +11,6 @@
 [![Crates.io](https://img.shields.io/crates/v/merino.svg)](https://crates.io/crates/merino)
 [![stego](https://docs.rs/merino/badge.svg)](https://docs.rs/merino)
 [![License](https://img.shields.io/crates/l/pbr.svg)](https://github.com/ajmwagar/merino/blob/master/LICENSE.md)
-[![Build Status](https://travis-ci.org/ajmwagar/merino.svg?branch=master)](https://travis-ci.org/ajmwagar/merino)
 [![dependency status](https://deps.rs/repo/github/ajmwagar/merino/status.svg)](https://deps.rs/repo/github/ajmwagar/merino)
 
 ## 🎁 Features
