@@ -6,7 +6,7 @@ repository = "https://github.com/ajmwagar/merino"
 readme = "README.md"
 license = "MIT"
 authors = ["Avery Wagar <ajmw.subs@gmail.com>"]
-edition = "2018"
+edition = "2024"
 
 [profile.release]
 opt-level = 3

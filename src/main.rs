@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), deny(warnings))]
-#![warn(clippy::all, rust_2018_idioms)]
+#![warn(clippy::all)]
 #[macro_use]
 extern crate log;
 
@@ -70,24 +70,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Setup logging
     let log_env = env::var("RUST_LOG");
-    if log_env.is_err() {
-        let level = match opt.verbosity {
-            1 => "merino=DEBUG",
-            2 => "merino=TRACE",
-            _ => "merino=INFO",
-        };
-        env::set_var("RUST_LOG", level);
-    }
 
     if !opt.quiet {
-        pretty_env_logger::init_timed();
+        let mut builder = pretty_env_logger::formatted_timed_builder();
+        match &log_env {
+            // An explicit RUST_LOG takes precedence over the verbosity flags.
+            Ok(filter) => {
+                builder.parse_filters(filter);
+            }
+            Err(_) => {
+                let level = match opt.verbosity {
+                    1 => "merino=DEBUG",
+                    2 => "merino=TRACE",
+                    _ => "merino=INFO",
+                };
+                builder.parse_filters(level);
+            }
+        }
+        builder.init();
     }
 
-    if log_env.is_ok() && (opt.verbosity != 0) {
+    if let (Ok(filter), true) = (&log_env, opt.verbosity != 0) {
         warn!(
             "Log level is overriden by environmental variable to `{}`",
-            // It's safe to unwrap() because we checked for is_ok() before
-            log_env.unwrap().as_str()
+            filter
         );
     }
 
@@ -105,7 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(users_file) => {
             auth_methods.push(AuthMethods::UserPass as u8);
             let file = std::fs::File::open(&users_file).unwrap_or_else(|e| {
-                error!("Can't open file {:?}: {}", &users_file, e);
+                error!("Can't open file {:?}: {}", users_file, e);
                 std::process::exit(1);
             });
 
@@ -117,7 +123,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     It is recommended that your users file is NOT accessible by others. \
                     To override this check, set --allow-insecure",
                     metadata.mode() & 0o777,
-                    &users_file
+                    users_file
                 );
                 std::process::exit(1);
             }
@@ -141,7 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if users.is_empty() {
                 error!(
                     "No users loaded from {:?}. Check configuration.",
-                    &users_file
+                    users_file
                 );
                 std::process::exit(1);
             }

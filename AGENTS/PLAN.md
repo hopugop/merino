@@ -13,7 +13,7 @@ Each phase is independently committable and verifiable.
 
 ## Constraints & conventions
 
-- Rust edition 2018; keep `#![forbid(unsafe_code)]`.
+- Rust edition 2024 (toolchain pinned in `rust-toolchain.toml`); keep `#![forbid(unsafe_code)]`.
 - CI only builds Docker today. Run `cargo test` and `cargo clippy --all-targets`
   locally before each commit.
 - Do not break the public `Merino` / `SOCKClient` API mid-migration; the actix
