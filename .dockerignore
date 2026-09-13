@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+.travis.yml
+*.md
+users.csv
+Dockerfile
+.dockerignore
