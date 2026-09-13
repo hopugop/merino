@@ -22,8 +22,8 @@ Current state (from `README.md` and `src/lib.rs`):
 - `[ ]` Custom plugin / middleware support
 - `[ ]` `BIND`
 - `[ ]` `UDP ASSOCIATE`
-- `[ ]` Benchmarks & unit tests
-- `[ ]` Actix-based backend
+- `[x]` Benchmarks & unit tests
+- `[x]` Actix-based backend
 - `[ ]` `SOCKS4` / `SOCKS4a` support
 
 ---
@@ -157,6 +157,11 @@ backend where each association can be its own actor.
 
 ## 5. Benchmarks
 
+**Status: partly complete.** `benches/proxy.rs` (criterion, stable) benchmarks a
+full `NOAUTH` handshake + `CONNECT` relay against a loopback echo server;
+`cargo bench` is documented in `README.md`. Remaining follow-ups: dedicated
+parse micro-benchmarks and `USERPASS` lookup benchmarks, plus a CI bench job.
+
 **Goal.** Track handshake and relay performance and catch regressions.
 
 **Suggested approach.**
@@ -185,6 +190,10 @@ reusable loopback fixtures.
 
 ## 6. Unit / integration tests
 
+**Status: complete.** Protocol unit tests live inline in `src/lib.rs`; loopback
+integration tests in `tests/socks5.rs` and `tests/actors.rs` cover the
+`NOAUTH`/`USERPASS` handshakes and the `CONNECT` relay on both backends.
+
 **Goal.** Cover protocol parsing, authentication, and relaying with automated
 tests.
 
@@ -203,6 +212,11 @@ tests.
 ---
 
 ## 7. Actix-based backend
+
+**Status: complete.** Implemented in [`PLAN.md`](PLAN.md) phases 3–4:
+`SocksServer` / `SocksConnection` actors in `src/actors.rs`, the binary now
+runs on an `actix::System`, and `tests/actors.rs` covers parity with the
+original Tokio loop.
 
 **Goal.** Replace the bespoke `tokio::spawn` accept loop with an
 [`actix`](https://github.com/actix/actix) actor supervision tree.

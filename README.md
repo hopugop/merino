@@ -68,6 +68,22 @@ OR
 docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/ajmwagar/merino:latest --no-auth --port=8001
 ```
 
+## 🧪 Development
+
+```bash
+# Unit + integration tests (protocol parsing, NOAUTH/USERPASS, CONNECT relay)
+cargo test
+
+# End-to-end SOCKS5 handshake/relay benchmark (criterion)
+cargo bench
+
+# Lints
+cargo clippy --all-targets
+```
+
+See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap and
+[`AGENTS/PLAN.md`](AGENTS/PLAN.md) for the implementation plan.
+
 # 🚥 Roadmap
 
 - [x] IPV6 Support
@@ -80,6 +96,6 @@ docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/ajmwagar/m
   - [x] `CONNECT`
   - [ ] `BIND`
   - [ ] `ASSOCIATE`
-- [ ] Benchmarks & Unit tests
-- [ ] [Actix](https://github.com/actix-rs/actix) based backend
+- [x] Benchmarks & Unit tests
+- [x] [Actix](https://github.com/actix-rs/actix) based backend
 - [ ] `SOCKS4`/`SOCKS4a` Support

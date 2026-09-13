@@ -23,3 +23,10 @@ serde_derive = "1.0.229"
 snafu = "0.9.2"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[[bench]]
+name = "proxy"
+harness = false
