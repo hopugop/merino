@@ -25,6 +25,16 @@ pub struct User {
     password: String,
 }
 
+impl User {
+    /// Create a new user from a username / password pair
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+}
+
 pub struct SocksReply {
     // From rfc 1928 (S6),
     // the server evaluates the request, and returns a reply formed as follows:
@@ -219,6 +229,11 @@ impl Merino {
             users: Arc::new(users),
             timeout,
         })
+    }
+
+    /// Return the address the listener is bound to
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
     }
 
     pub async fn serve(&mut self) {
@@ -457,7 +472,13 @@ where
                         async move { TcpStream::connect(&sock_addr[..]).await },
                     )
                     .await
-                    .map_err(|_| MerinoError::Socks(ResponseCode::ConnectionRefused))??;
+                    .map_err(|_| MerinoError::Socks(ResponseCode::ConnectionRefused))?
+                    .map_err(|e| match e.kind() {
+                        io::ErrorKind::ConnectionRefused => {
+                            MerinoError::Socks(ResponseCode::ConnectionRefused)
+                        }
+                        _ => MerinoError::Io(e),
+                    })?;
 
                 trace!("Connected!");
 
@@ -476,14 +497,8 @@ where
                     Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
                 }
             }
-            SockCommand::Bind => Err(MerinoError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Bind not supported",
-            ))),
-            SockCommand::UdpAssosiate => Err(MerinoError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "UdpAssosiate not supported",
-            ))),
+            SockCommand::Bind => Err(MerinoError::Socks(ResponseCode::CommandNotSupported)),
+            SockCommand::UdpAssosiate => Err(MerinoError::Socks(ResponseCode::CommandNotSupported)),
         }
     }
 
