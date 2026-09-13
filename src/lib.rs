@@ -133,7 +133,7 @@ impl From<MerinoError> for ResponseCode {
 }
 
 /// DST.addr variant types
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum AddrType {
     /// IP V4 address: X'01'
     V4 = 0x01,
@@ -673,5 +673,135 @@ impl SOCKSReq {
             addr,
             port,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn addr_type_from_byte() {
+        assert_eq!(AddrType::from(1), Some(AddrType::V4));
+        assert_eq!(AddrType::from(3), Some(AddrType::Domain));
+        assert_eq!(AddrType::from(4), Some(AddrType::V6));
+        assert_eq!(AddrType::from(0), None);
+        assert_eq!(AddrType::from(2), None);
+        assert_eq!(AddrType::from(255), None);
+    }
+
+    #[test]
+    fn sock_command_from_byte() {
+        assert!(matches!(SockCommand::from(1), Some(SockCommand::Connect)));
+        assert!(matches!(SockCommand::from(2), Some(SockCommand::Bind)));
+        assert!(matches!(
+            SockCommand::from(3),
+            Some(SockCommand::UdpAssosiate)
+        ));
+        assert!(SockCommand::from(0).is_none());
+        assert!(SockCommand::from(4).is_none());
+        assert!(SockCommand::from(255).is_none());
+    }
+
+    #[test]
+    fn pretty_print_ipv4() {
+        assert_eq!(pretty_print_addr(&AddrType::V4, &[127, 0, 0, 1]), "127.0.0.1");
+        assert_eq!(pretty_print_addr(&AddrType::V4, &[8, 8, 4, 4]), "8.8.4.4");
+    }
+
+    #[test]
+    fn pretty_print_ipv6() {
+        let raw = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        assert_eq!(
+            pretty_print_addr(&AddrType::V6, &raw),
+            "2001:db8:0:0:0:0:0:1"
+        );
+    }
+
+    #[test]
+    fn pretty_print_domain() {
+        assert_eq!(
+            pretty_print_addr(&AddrType::Domain, b"example.com"),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn socks_reply_wire_format() {
+        let success = SocksReply::new(ResponseCode::Success);
+        assert_eq!(success.buf, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+        let failure = SocksReply::new(ResponseCode::ConnectionRefused);
+        assert_eq!(failure.buf, [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn method_and_response_codes_match_rfc() {
+        assert_eq!(AuthMethods::NoAuth as u8, 0x00);
+        assert_eq!(AuthMethods::UserPass as u8, 0x02);
+        assert_eq!(AuthMethods::NoMethods as u8, 0xFF);
+
+        assert_eq!(ResponseCode::Success as u8, 0x00);
+        assert_eq!(ResponseCode::Failure as u8, 0x01);
+        assert_eq!(ResponseCode::RuleFailure as u8, 0x02);
+        assert_eq!(ResponseCode::NetworkUnreachable as u8, 0x03);
+        assert_eq!(ResponseCode::HostUnreachable as u8, 0x04);
+        assert_eq!(ResponseCode::ConnectionRefused as u8, 0x05);
+        assert_eq!(ResponseCode::TtlExpired as u8, 0x06);
+        assert_eq!(ResponseCode::CommandNotSupported as u8, 0x07);
+        assert_eq!(ResponseCode::AddrTypeNotSupported as u8, 0x08);
+    }
+
+    #[test]
+    fn merino_error_to_response_code() {
+        let socks: ResponseCode = MerinoError::Socks(ResponseCode::HostUnreachable).into();
+        assert_eq!(socks as u8, ResponseCode::HostUnreachable as u8);
+
+        let io: ResponseCode = MerinoError::Io(io::Error::other("boom")).into();
+        assert_eq!(io as u8, ResponseCode::Failure as u8);
+    }
+
+    #[tokio::test]
+    async fn addr_to_socket_ipv4() {
+        let addr = addr_to_socket(&AddrType::V4, &[127, 0, 0, 1], 8080)
+            .await
+            .unwrap();
+        assert_eq!(
+            addr,
+            vec![SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(127, 0, 0, 1),
+                8080
+            ))]
+        );
+    }
+
+    #[tokio::test]
+    async fn addr_to_socket_ipv6() {
+        let raw = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        let addr = addr_to_socket(&AddrType::V6, &raw, 443).await.unwrap();
+        assert_eq!(
+            addr,
+            vec![SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                443,
+                0,
+                0
+            ))]
+        );
+    }
+
+    #[test]
+    fn user_deserializes_from_csv() {
+        let data = "username,password\nalice,secret\n";
+        let mut rdr = csv::Reader::from_reader(data.as_bytes());
+        let users: Vec<User> = rdr.deserialize().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            users,
+            vec![User {
+                username: "alice".into(),
+                password: "secret".into(),
+            }]
+        );
     }
 }
