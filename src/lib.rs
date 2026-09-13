@@ -5,6 +5,9 @@ extern crate serde_derive;
 extern crate log;
 use snafu::Snafu;
 
+mod actors;
+pub use actors::{SocksConnection, SocksServer};
+
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -241,25 +244,33 @@ impl Merino {
         while let Ok((stream, client_addr)) = self.listener.accept().await {
             let users = self.users.clone();
             let auth_methods = self.auth_methods.clone();
-            let timeout = self.timeout.clone();
+            let timeout = self.timeout;
             tokio::spawn(async move {
-                let mut client = SOCKClient::new(stream, users, auth_methods, timeout);
-                match client.init().await {
-                    Ok(_) => {}
-                    Err(error) => {
-                        error!("Error! {:?}, client: {:?}", error, client_addr);
-
-                        if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await
-                        {
-                            warn!("Failed to send error code: {:?}", e);
-                        }
-
-                        if let Err(e) = client.shutdown().await {
-                            warn!("Failed to shutdown TcpStream: {:?}", e);
-                        };
-                    }
-                };
+                let client = SOCKClient::new(stream, users, auth_methods, timeout);
+                run_client(client, client_addr).await;
             });
+        }
+    }
+}
+
+/// Drive a single client connection to completion, replying with an error code
+/// and shutting the stream down when the SOCKS negotiation fails.
+pub(crate) async fn run_client<T>(mut client: SOCKClient<T>, client_addr: SocketAddr)
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    match client.init().await {
+        Ok(_) => {}
+        Err(error) => {
+            error!("Error! {:?}, client: {:?}", error, client_addr);
+
+            if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await {
+                warn!("Failed to send error code: {:?}", e);
+            }
+
+            if let Err(e) = client.shutdown().await {
+                warn!("Failed to shutdown TcpStream: {:?}", e);
+            };
         }
     }
 }

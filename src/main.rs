@@ -4,6 +4,7 @@
 #[macro_use]
 extern crate log;
 
+use actix::Actor;
 use clap::{ArgGroup, Parser};
 use merino::*;
 use std::env;
@@ -62,8 +63,7 @@ struct Opt {
     quiet: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", LOGO);
 
     let opt = Opt::parse();
@@ -163,11 +163,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let authed_users = authed_users?;
 
-    // Create proxy server
-    let mut merino = Merino::new(opt.port, &opt.ip, auth_methods, authed_users, None).await?;
-
-    // Start Proxies
-    merino.serve().await;
+    // Start the actix system and the proxy server actor. The actor must be
+    // created from inside the system's runtime context.
+    let sys = actix::System::new();
+    let server = sys.block_on(SocksServer::bind(
+        opt.port,
+        &opt.ip,
+        auth_methods,
+        authed_users,
+        None,
+    ))?;
+    sys.block_on(async move {
+        server.start();
+    });
+    sys.run()?;
 
     Ok(())
 }
