@@ -26,7 +26,6 @@ const LOGO: &str = r"
 #[command(version)]
 #[command(group(
     ArgGroup::new("auth")
-        .required(true)
         .args(["no_auth", "users"]),
 ), group(
     ArgGroup::new("log")
@@ -151,6 +150,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => Ok(Vec::new()),
     };
+
+    // Fall back to NOAUTH when no authentication method was configured so a
+    // plain `merino` invocation starts a working proxy instead of failing.
+    if auth_methods.is_empty() {
+        warn!(
+            "No authentication method configured, defaulting to NOAUTH. \
+            Use --users <FILE> to require username/password authentication."
+        );
+        auth_methods.push(merino::AuthMethods::NoAuth as u8);
+    }
 
     let authed_users = authed_users?;
 
