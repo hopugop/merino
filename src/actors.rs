@@ -7,7 +7,7 @@ use actix::fut;
 use actix::prelude::*;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::{run_client, SOCKClient, User};
+use crate::{SOCKClient, User, bind_all, run_client};
 
 /// One actor per accepted TCP connection.
 ///
@@ -40,17 +40,22 @@ impl Actor for SocksConnection {
     }
 }
 
-/// Actor that owns the listening socket and supervises the accept loop.
+/// Actor that owns the listening sockets and supervises the accept loops.
+///
+/// A hostname may resolve to several addresses (an IPv4 and an IPv6 address on
+/// the same host, for example); one listener is bound per resolved address and
+/// a dedicated accept loop runs for each.
 pub struct SocksServer {
-    listener: Option<TcpListener>,
-    bound_addr: SocketAddr,
+    listeners: Vec<TcpListener>,
+    bound_addrs: Vec<SocketAddr>,
     users: Arc<Vec<User>>,
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
 }
 
 impl SocksServer {
-    /// Bind the listening socket and build the server actor.
+    /// Bind a listening socket for every address `ip` resolves to and build
+    /// the server actor.
     pub async fn bind(
         port: u16,
         ip: &str,
@@ -58,21 +63,28 @@ impl SocksServer {
         users: Vec<User>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        info!("Listening on {}:{}", ip, port);
-        let listener = TcpListener::bind((ip, port)).await?;
-        let bound_addr = listener.local_addr()?;
+        let listeners = bind_all(ip, port).await?;
+        let bound_addrs = listeners
+            .iter()
+            .map(TcpListener::local_addr)
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(Self {
-            listener: Some(listener),
-            bound_addr,
+            listeners,
+            bound_addrs,
             auth_methods: Arc::new(auth_methods),
             users: Arc::new(users),
             timeout,
         })
     }
 
-    /// Address the listener is bound to.
+    /// Address of the first listener.
     pub fn local_addr(&self) -> SocketAddr {
-        self.bound_addr
+        self.bound_addrs[0]
+    }
+
+    /// Address of every listener this server is bound to.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.bound_addrs
     }
 }
 
@@ -80,13 +92,14 @@ impl Actor for SocksServer {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let listener = self.listener.take().expect("server is started once");
         let users = self.users.clone();
         let auth_methods = self.auth_methods.clone();
         let timeout = self.timeout;
 
-        ctx.spawn(
-            fut::wrap_future::<_, SocksServer>(async move {
+        for listener in std::mem::take(&mut self.listeners) {
+            let users = users.clone();
+            let auth_methods = auth_methods.clone();
+            ctx.spawn(fut::wrap_future::<_, SocksServer>(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, peer)) => {
@@ -101,9 +114,8 @@ impl Actor for SocksServer {
                         Err(e) => warn!("Accept error: {:?}", e),
                     }
                 }
-            })
-            .map(|_, _, ctx: &mut Context<SocksServer>| ctx.stop()),
-        );
+            }));
+        }
     }
 }
 

@@ -7,6 +7,29 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn merino_listens_on_every_resolved_address() {
+    let mut merino = Merino::new(
+        0,
+        "localhost",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind Merino");
+    let addrs = merino.local_addrs().expect("failed to read local addrs");
+    tokio::spawn(async move {
+        merino.serve().await;
+    });
+
+    assert!(!addrs.is_empty(), "expected at least one bound address");
+    for addr in addrs {
+        let mut stream = connect(addr).await;
+        assert_eq!(greet(&mut stream, &[0x00]).await, 0x00);
+    }
+}
+
+#[tokio::test]
 async fn noauth_negotiation_succeeds() {
     let server = start_no_auth().await;
     let mut stream = connect(server.addr).await;

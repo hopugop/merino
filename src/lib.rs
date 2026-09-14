@@ -8,6 +8,7 @@ use snafu::Snafu;
 mod actors;
 pub use actors::{SocksConnection, SocksServer};
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -208,8 +209,57 @@ pub enum AuthMethods {
     NoMethods = 0xFF,
 }
 
+/// Bind a listener for every address `ip` resolves to.
+///
+/// `ip` may be an IP literal or a hostname. When a hostname resolves to both
+/// IPv4 and IPv6 addresses (for example `localhost` on a dual-stack host),
+/// every address is bound so the server accepts connections over both
+/// families and on every interface the name maps to. Duplicate addresses are
+/// collapsed. Addresses that fail to bind are logged and skipped; an error is
+/// returned only when none could be bound.
+pub(crate) async fn bind_all(ip: &str, port: u16) -> io::Result<Vec<TcpListener>> {
+    let mut seen = HashSet::new();
+    let addrs: Vec<SocketAddr> = lookup_host((ip, port))
+        .await?
+        .filter(|addr| seen.insert(*addr))
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no addresses resolved for {ip}"),
+        ));
+    }
+
+    let mut listeners = Vec::new();
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                info!("Listening on {}", listener.local_addr()?);
+                listeners.push(listener);
+            }
+            Err(e) => {
+                warn!("Failed to bind {}: {}", addr, e);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if listeners.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("could not bind any address for {ip}:{port}"),
+            )
+        }));
+    }
+
+    Ok(listeners)
+}
+
 pub struct Merino {
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     users: Arc<Vec<User>>,
     auth_methods: Arc<Vec<u8>>,
     // Timeout for connections
@@ -225,31 +275,53 @@ impl Merino {
         users: Vec<User>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        info!("Listening on {}:{}", ip, port);
         Ok(Merino {
-            listener: TcpListener::bind((ip, port)).await?,
+            listeners: bind_all(ip, port).await?,
             auth_methods: Arc::new(auth_methods),
             users: Arc::new(users),
             timeout,
         })
     }
 
-    /// Return the address the listener is bound to
+    /// Return the first address a listener is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listeners
+            .first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no listeners bound"))?
+            .local_addr()
+    }
+
+    /// Return the address of every listener this server is bound to
+    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.listeners.iter().map(TcpListener::local_addr).collect()
     }
 
     pub async fn serve(&mut self) {
         info!("Serving Connections...");
-        while let Ok((stream, client_addr)) = self.listener.accept().await {
+        let listeners = std::mem::take(&mut self.listeners);
+        let mut set = tokio::task::JoinSet::new();
+        for listener in listeners {
             let users = self.users.clone();
             let auth_methods = self.auth_methods.clone();
             let timeout = self.timeout;
-            tokio::spawn(async move {
-                let client = SOCKClient::new(stream, users, auth_methods, timeout);
-                run_client(client, client_addr).await;
+            set.spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, client_addr)) => {
+                            let client = SOCKClient::new(
+                                stream,
+                                users.clone(),
+                                auth_methods.clone(),
+                                timeout,
+                            );
+                            tokio::spawn(run_client(client, client_addr));
+                        }
+                        Err(e) => warn!("Accept error: {:?}", e),
+                    }
+                }
             });
         }
+        while set.join_next().await.is_some() {}
     }
 }
 
@@ -348,8 +420,7 @@ where
 
         trace!(
             "Version: {} Auth nmethods: {}",
-            self.socks_version,
-            self.auth_nmethods
+            self.socks_version, self.auth_nmethods
         );
 
         match self.socks_version {
@@ -524,7 +595,11 @@ where
 }
 
 /// Convert an address and AddrType to a SocketAddr
-async fn addr_to_socket(addr_type: &AddrType, addr: &[u8], port: u16) -> io::Result<Vec<SocketAddr>> {
+async fn addr_to_socket(
+    addr_type: &AddrType,
+    addr: &[u8],
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
     match addr_type {
         AddrType::V6 => {
             let new_addr = (0..8)
@@ -728,7 +803,10 @@ mod tests {
 
     #[test]
     fn pretty_print_ipv4() {
-        assert_eq!(pretty_print_addr(&AddrType::V4, &[127, 0, 0, 1]), "127.0.0.1");
+        assert_eq!(
+            pretty_print_addr(&AddrType::V4, &[127, 0, 0, 1]),
+            "127.0.0.1"
+        );
         assert_eq!(pretty_print_addr(&AddrType::V4, &[8, 8, 4, 4]), "8.8.4.4");
     }
 

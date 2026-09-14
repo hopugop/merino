@@ -30,6 +30,27 @@ async fn start_actors_userpass(users: Vec<User>) -> SocketAddr {
 }
 
 #[actix::test]
+async fn listens_on_every_resolved_address() {
+    let server = SocksServer::bind(
+        0,
+        "localhost",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind SocksServer");
+    let addrs = server.local_addrs().to_vec();
+    assert!(!addrs.is_empty(), "expected at least one bound address");
+    server.start();
+
+    for addr in addrs {
+        let mut stream = connect(addr).await;
+        assert_eq!(greet(&mut stream, &[0x00]).await, 0x00);
+    }
+}
+
+#[actix::test]
 async fn noauth_negotiation_succeeds() {
     let addr = start_actors_no_auth().await;
     let mut stream = connect(addr).await;
