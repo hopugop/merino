@@ -23,6 +23,11 @@ const SOCKS_VERSION: u8 = 0x05;
 
 const RESERVED: u8 = 0x00;
 
+/// Default time budget for the whole SOCKS5 handshake (greeting + auth) before
+/// the server gives up on a slow or stalled client. Protects against
+/// slowloris-style connections that trickle bytes to hold a task open.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct User {
     pub username: String,
@@ -104,6 +109,11 @@ impl SocksReply {
         stream.write_all(&self.buf[..]).await?;
         Ok(())
     }
+
+    /// The raw 10-byte wire representation of this reply.
+    pub fn as_bytes(&self) -> &[u8; 10] {
+        &self.buf
+    }
 }
 
 #[derive(Error, Debug)]
@@ -147,8 +157,8 @@ impl From<MerinoError> for ResponseCode {
 }
 
 /// DST.addr variant types
-#[derive(Debug, PartialEq)]
-enum AddrType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddrType {
     /// IP V4 address: X'01'
     V4 = 0x01,
     /// DOMAINNAME: X'03'
@@ -159,7 +169,7 @@ enum AddrType {
 
 impl AddrType {
     /// Parse Byte to Command
-    fn from(n: usize) -> Option<AddrType> {
+    pub fn from(n: usize) -> Option<AddrType> {
         match n {
             1 => Some(AddrType::V4),
             3 => Some(AddrType::Domain),
@@ -179,8 +189,8 @@ impl AddrType {
 }
 
 /// SOCK5 CMD Type
-#[derive(Debug)]
-enum SockCommand {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SockCommand {
     Connect = 0x01,
     Bind = 0x02,
     UdpAssosiate = 0x3,
@@ -188,7 +198,7 @@ enum SockCommand {
 
 impl SockCommand {
     /// Parse Byte to Command
-    fn from(n: usize) -> Option<SockCommand> {
+    pub fn from(n: usize) -> Option<SockCommand> {
         match n {
             1 => Some(SockCommand::Connect),
             2 => Some(SockCommand::Bind),
@@ -354,6 +364,7 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     authed_users: Arc<Vec<User>>,
     socks_version: u8,
     timeout: Option<Duration>,
+    handshake_timeout: Duration,
 }
 
 impl<T> SOCKClient<T>
@@ -374,6 +385,7 @@ where
             authed_users,
             auth_methods,
             timeout,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -390,7 +402,13 @@ where
             authed_users,
             auth_methods,
             timeout,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Override the maximum time allowed for the SOCKS5 handshake.
+    pub fn set_handshake_timeout(&mut self, timeout: Duration) {
+        self.handshake_timeout = timeout;
     }
 
     /// Mutable getter for inner stream
@@ -398,9 +416,19 @@ where
         &mut self.stream
     }
 
-    /// Check if username + password pair are valid
+    /// Check if username + password pair are valid.
+    ///
+    /// The comparison is written to avoid early exit on a mismatch and to
+    /// inspect every configured user, so the work done does not reveal which
+    /// entry (if any) matched or how far a wrong password got.
     fn authed(&self, user: &User) -> bool {
-        self.authed_users.contains(user)
+        let mut found = false;
+        for candidate in self.authed_users.iter() {
+            let username_ok = ct_eq(user.username.as_bytes(), candidate.username.as_bytes());
+            let password_ok = ct_eq(user.password.as_bytes(), candidate.password.as_bytes());
+            found |= username_ok & password_ok;
+        }
+        found
     }
 
     /// Shutdown a client
@@ -409,7 +437,31 @@ where
         Ok(())
     }
 
+    /// Drive a connection: negotiate (bounded by the handshake timeout) and
+    /// then relay.
+    ///
+    /// Only the negotiation — greeting, authentication and reading the request
+    /// — is subject to [`SOCKClient::set_handshake_timeout`]. The relay itself
+    /// is intentionally unbounded so long-lived proxied connections are not
+    /// torn down after the handshake budget elapses. A stalled client is
+    /// disconnected with a `TTL expired` reply.
     pub async fn init(&mut self) -> Result<(), MerinoError> {
+        let req = match timeout(self.handshake_timeout, self.negotiate()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(
+                    "SOCKS handshake timed out after {:?}",
+                    self.handshake_timeout
+                );
+                return Err(MerinoError::Socks(ResponseCode::TtlExpired));
+            }
+        };
+
+        self.handle_request(req).await?;
+        Ok(())
+    }
+
+    async fn negotiate(&mut self) -> Result<SOCKSReq, MerinoError> {
         debug!("New connection");
         let mut header = [0u8; 2];
         // Read a byte from the stream and determine the version being requested
@@ -427,16 +479,15 @@ where
             SOCKS_VERSION => {
                 // Authenticate w/ client
                 self.auth().await?;
-                // Handle requests
-                self.handle_client().await?;
+                // Read the request (still inside the handshake budget).
+                SOCKSReq::from_stream(&mut self.stream).await
             }
             _ => {
                 warn!("Init: Unsupported version: SOCKS{}", self.socks_version);
                 self.shutdown().await?;
+                Err(MerinoError::Socks(ResponseCode::Failure))
             }
         }
-
-        Ok(())
     }
 
     async fn auth(&mut self) -> Result<(), MerinoError> {
@@ -462,8 +513,6 @@ where
             // Read a byte from the stream and determine the version being requested
             self.stream.read_exact(&mut header).await?;
 
-            // debug!("Auth Header: [{}, {}]", header[0], header[1]);
-
             // Username parsing
             let ulen = header[1] as usize;
 
@@ -478,8 +527,28 @@ where
             let mut password = vec![0; plen[0] as usize];
             self.stream.read_exact(&mut password).await?;
 
-            let username = String::from_utf8_lossy(&username).to_string();
-            let password = String::from_utf8_lossy(&password).to_string();
+            // Re-parse the assembled frame through the pure parser so the
+            // sub-negotiation version is validated in exactly one place.
+            let mut frame = Vec::with_capacity(2 + username.len() + 1 + password.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&username);
+            frame.push(plen[0]);
+            frame.extend_from_slice(&password);
+            let (parsed, _) = parse_userpass(&frame)?;
+
+            if parsed.version != 0x01 {
+                warn!(
+                    "Invalid USERPASS sub-negotiation version: {}",
+                    parsed.version
+                );
+                let response = [1, ResponseCode::Failure as u8];
+                self.stream.write_all(&response).await?;
+                self.shutdown().await?;
+                return Err(MerinoError::Socks(ResponseCode::Failure));
+            }
+
+            let username = String::from_utf8_lossy(parsed.username).to_string();
+            let password = String::from_utf8_lossy(parsed.password).to_string();
 
             let user = User { username, password };
 
@@ -515,11 +584,19 @@ where
         }
     }
 
-    /// Handles a client
+    /// Read a request from the stream and handle it.
+    ///
+    /// Kept for API compatibility; [`SOCKClient::init`] performs the same read
+    /// as part of the bounded negotiation and then calls `handle_request`
+    /// directly.
     pub async fn handle_client(&mut self) -> Result<usize, MerinoError> {
-        debug!("Starting to relay data");
-
         let req = SOCKSReq::from_stream(&mut self.stream).await?;
+        self.handle_request(req).await
+    }
+
+    /// Handle an already-parsed request (connect + relay).
+    async fn handle_request(&mut self, req: SOCKSReq) -> Result<usize, MerinoError> {
+        debug!("Starting to relay data");
 
         // Log Request
         let displayed_addr = pretty_print_addr(&req.addr_type, &req.addr);
@@ -602,6 +679,12 @@ async fn addr_to_socket(
 ) -> io::Result<Vec<SocketAddr>> {
     match addr_type {
         AddrType::V6 => {
+            if addr.len() < 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IPv6 address must be 16 bytes",
+                ));
+            }
             let new_addr = (0..8)
                 .map(|x| {
                     trace!("{} and {}", x * 2, (x * 2) + 1);
@@ -625,10 +708,18 @@ async fn addr_to_socket(
                 0,
             ))])
         }
-        AddrType::V4 => Ok(vec![SocketAddr::from(SocketAddrV4::new(
-            Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
-            port,
-        ))]),
+        AddrType::V4 => {
+            if addr.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IPv4 address must be 4 bytes",
+                ));
+            }
+            Ok(vec![SocketAddr::from(SocketAddrV4::new(
+                Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
+                port,
+            ))])
+        }
         AddrType::Domain => {
             let mut domain = String::from_utf8_lossy(addr).to_string();
             domain.push(':');
@@ -640,15 +731,22 @@ async fn addr_to_socket(
 }
 
 /// Convert an AddrType and address to String
-fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
+pub fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
     match addr_type {
         AddrType::Domain => String::from_utf8_lossy(addr).to_string(),
-        AddrType::V4 => addr
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<String>>()
-            .join("."),
+        AddrType::V4 => {
+            if addr.len() < 4 {
+                return format!("<invalid ipv4: {} bytes>", addr.len());
+            }
+            addr.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<String>>()
+                .join(".")
+        }
         AddrType::V6 => {
+            if addr.len() < 16 {
+                return format!("<invalid ipv6: {} bytes>", addr.len());
+            }
             let addr_16 = (0..8)
                 .map(|x| (u16::from(addr[x * 2]) << 8) | u16::from(addr[(x * 2) + 1]))
                 .collect::<Vec<u16>>();
@@ -663,13 +761,167 @@ fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
 }
 
 /// Proxy User Request
-#[allow(dead_code)]
-struct SOCKSReq {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SOCKSReq {
     pub version: u8,
     pub command: SockCommand,
     pub addr_type: AddrType,
     pub addr: Vec<u8>,
     pub port: u16,
+}
+
+/// Error used by the pure parsers when a message ends before all of its
+/// declared fields have been read.
+pub(crate) fn truncated() -> MerinoError {
+    MerinoError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "truncated SOCKS message",
+    ))
+}
+
+/// Compare two byte strings without an early exit on the first differing byte.
+///
+/// The length is still observable, but this avoids leaking *where* a username
+/// or password first diverges through timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Parse the SOCKS5 greeting (`VER, NMETHODS, METHODS..`) from a byte slice.
+///
+/// Returns `(version, nmethods, methods, consumed)`. Only the bytes belonging
+/// to the greeting are inspected; trailing pipelined data is left untouched.
+pub fn parse_greeting(bytes: &[u8]) -> Result<(u8, u8, Vec<u8>, usize), MerinoError> {
+    if bytes.len() < 2 {
+        return Err(truncated());
+    }
+    let version = bytes[0];
+    let nmethods = bytes[1];
+    let consumed = 2 + usize::from(nmethods);
+    if bytes.len() < consumed {
+        return Err(truncated());
+    }
+    Ok((version, nmethods, bytes[2..consumed].to_vec(), consumed))
+}
+
+/// A parsed USERPASS sub-negotiation frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserPassRequest<'a> {
+    pub version: u8,
+    pub username: &'a [u8],
+    pub password: &'a [u8],
+}
+
+/// Parse a USERPASS sub-negotiation frame
+/// (`VER, ULEN, UNAME.., PLEN, PASSWD..`) from a byte slice.
+///
+/// Returns the parsed request and the number of bytes consumed.
+pub fn parse_userpass(bytes: &[u8]) -> Result<(UserPassRequest<'_>, usize), MerinoError> {
+    if bytes.len() < 2 {
+        return Err(truncated());
+    }
+    let version = bytes[0];
+    let ulen = usize::from(bytes[1]);
+    let mut pos = 2;
+    if bytes.len() < pos + ulen {
+        return Err(truncated());
+    }
+    let username = &bytes[pos..pos + ulen];
+    pos += ulen;
+
+    if bytes.len() < pos + 1 {
+        return Err(truncated());
+    }
+    let plen = usize::from(bytes[pos]);
+    pos += 1;
+    if bytes.len() < pos + plen {
+        return Err(truncated());
+    }
+    let password = &bytes[pos..pos + plen];
+    pos += plen;
+
+    Ok((
+        UserPassRequest {
+            version,
+            username,
+            password,
+        },
+        pos,
+    ))
+}
+
+/// Parse a SOCKS5 request (`VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT`) from a
+/// byte slice.
+///
+/// Returns the request and the number of bytes consumed. The address length is
+/// derived from `ATYP`, and the slice must contain exactly that many address
+/// bytes plus the two port bytes; anything short yields `truncated()`.
+pub fn parse_request(bytes: &[u8]) -> Result<(SOCKSReq, usize), MerinoError> {
+    if bytes.len() < 4 {
+        return Err(truncated());
+    }
+    let version = bytes[0];
+    let command = SockCommand::from(bytes[1] as usize)
+        .ok_or(MerinoError::Socks(ResponseCode::CommandNotSupported))?;
+    let addr_type = AddrType::from(bytes[3] as usize)
+        .ok_or(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))?;
+
+    let mut pos = 4;
+    let addr: Vec<u8> = match addr_type {
+        AddrType::Domain => {
+            if bytes.len() < pos + 1 {
+                return Err(truncated());
+            }
+            let dlen = usize::from(bytes[pos]);
+            pos += 1;
+            if bytes.len() < pos + dlen {
+                return Err(truncated());
+            }
+            let addr = bytes[pos..pos + dlen].to_vec();
+            pos += dlen;
+            addr
+        }
+        AddrType::V4 => {
+            if bytes.len() < pos + 4 {
+                return Err(truncated());
+            }
+            let addr = bytes[pos..pos + 4].to_vec();
+            pos += 4;
+            addr
+        }
+        AddrType::V6 => {
+            if bytes.len() < pos + 16 {
+                return Err(truncated());
+            }
+            let addr = bytes[pos..pos + 16].to_vec();
+            pos += 16;
+            addr
+        }
+    };
+
+    if bytes.len() < pos + 2 {
+        return Err(truncated());
+    }
+    let port = (u16::from(bytes[pos]) << 8) | u16::from(bytes[pos + 1]);
+    pos += 2;
+
+    Ok((
+        SOCKSReq {
+            version,
+            command,
+            addr_type,
+            addr,
+            port,
+        },
+        pos,
+    ))
 }
 
 impl SOCKSReq {
@@ -702,74 +954,66 @@ impl SOCKSReq {
         //      o  DST.PORT desired destination port in network octet
         //         order
         trace!("Server waiting for connect");
-        let mut packet = [0u8; 4];
-        // Read a byte from the stream and determine the version being requested
-        stream.read_exact(&mut packet).await?;
-        trace!("Server received {:?}", packet);
+        // Read the fixed request header first so the address type is known.
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).await?;
+        trace!("Server received {:?}", header);
 
-        if packet[0] != SOCKS_VERSION {
-            warn!("from_stream Unsupported version: SOCKS{}", packet[0]);
-            stream.shutdown().await?;
+        if header[0] != SOCKS_VERSION {
+            warn!("from_stream Unsupported version: SOCKS{}", header[0]);
+            return Err(MerinoError::Socks(ResponseCode::Failure));
         }
 
-        // Get command
-        let command = match SockCommand::from(packet[1] as usize) {
-            Some(com) => Ok(com),
-            None => {
-                warn!("Invalid Command");
-                stream.shutdown().await?;
-                Err(MerinoError::Socks(ResponseCode::CommandNotSupported))
-            }
-        }?;
-
-        // DST.address
-
-        let addr_type = match AddrType::from(packet[3] as usize) {
-            Some(addr) => Ok(addr),
+        // Reject unsupported commands / address types before reading the
+        // variable-length body, matching the original error replies. The
+        // error is returned (not written here) so `run_client` can send the
+        // correct reply before shutting the stream down.
+        if SockCommand::from(header[1] as usize).is_none() {
+            warn!("Invalid Command");
+            return Err(MerinoError::Socks(ResponseCode::CommandNotSupported));
+        }
+        let addr_type = match AddrType::from(header[3] as usize) {
+            Some(addr) => addr,
             None => {
                 error!("No Addr");
-                stream.shutdown().await?;
-                Err(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))
+                return Err(MerinoError::Socks(ResponseCode::AddrTypeNotSupported));
             }
-        }?;
+        };
 
-        trace!("Getting Addr");
-        // Get Addr from addr_type and stream
-        let addr: Vec<u8> = match addr_type {
+        // Assemble the complete frame byte-for-byte, then hand it to the pure
+        // parser. Keeping the wire format in one place makes it directly
+        // fuzzable and avoids duplicated length arithmetic.
+        let mut frame = Vec::with_capacity(22);
+        frame.extend_from_slice(&header);
+
+        match addr_type {
             AddrType::Domain => {
                 let mut dlen = [0u8; 1];
                 stream.read_exact(&mut dlen).await?;
+                frame.push(dlen[0]);
                 let mut domain = vec![0u8; dlen[0] as usize];
                 stream.read_exact(&mut domain).await?;
-                domain
+                frame.extend_from_slice(&domain);
             }
             AddrType::V4 => {
                 let mut addr = [0u8; 4];
                 stream.read_exact(&mut addr).await?;
-                addr.to_vec()
+                frame.extend_from_slice(&addr);
             }
             AddrType::V6 => {
                 let mut addr = [0u8; 16];
                 stream.read_exact(&mut addr).await?;
-                addr.to_vec()
+                frame.extend_from_slice(&addr);
             }
-        };
+        }
 
-        // read DST.port
+        // Read DST.port
         let mut port = [0u8; 2];
         stream.read_exact(&mut port).await?;
+        frame.extend_from_slice(&port);
 
-        // Merge two u8s into u16
-        let port = (u16::from(port[0]) << 8) | u16::from(port[1]);
-
-        // Return parsed request
-        Ok(SOCKSReq {
-            version: packet[0],
-            command,
-            addr_type,
-            addr,
-            port,
-        })
+        let (req, _consumed) = parse_request(&frame)?;
+        Ok(req)
     }
 }
 
@@ -903,5 +1147,112 @@ mod tests {
                 password: "secret".into(),
             }]
         );
+    }
+
+    #[test]
+    fn parse_greeting_basic() {
+        let (version, nmethods, methods, consumed) =
+            parse_greeting(&[0x05, 0x02, 0x00, 0x02]).unwrap();
+        assert_eq!(version, 0x05);
+        assert_eq!(nmethods, 0x02);
+        assert_eq!(methods, vec![0x00, 0x02]);
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn parse_greeting_leaves_pipelined_bytes() {
+        let (_, _, methods, consumed) = parse_greeting(&[0x05, 0x01, 0x00, 0xAA, 0xBB]).unwrap();
+        assert_eq!(methods, vec![0x00]);
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn parse_greeting_truncated_errors() {
+        assert!(parse_greeting(&[]).is_err());
+        assert!(parse_greeting(&[0x05]).is_err());
+        // claims two methods but supplies one
+        assert!(parse_greeting(&[0x05, 0x02, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_userpass_basic() {
+        let frame = [0x01, 0x02, b'a', b'b', 0x03, b'x', b'y', b'z'];
+        let (parsed, consumed) = parse_userpass(&frame).unwrap();
+        assert_eq!(parsed.version, 0x01);
+        assert_eq!(parsed.username, b"ab");
+        assert_eq!(parsed.password, b"xyz");
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_userpass_truncated_errors() {
+        assert!(parse_userpass(&[]).is_err());
+        assert!(parse_userpass(&[0x01, 0x05, b'a']).is_err());
+        // no password length byte
+        assert!(parse_userpass(&[0x01, 0x01, b'a']).is_err());
+        // password length exceeds body
+        assert!(parse_userpass(&[0x01, 0x01, b'a', 0x04, b'b']).is_err());
+    }
+
+    #[test]
+    fn parse_request_ipv4_roundtrip() {
+        let frame = [0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90];
+        let (req, consumed) = parse_request(&frame).unwrap();
+        assert_eq!(req.version, 0x05);
+        assert_eq!(req.command, SockCommand::Connect);
+        assert_eq!(req.addr_type, AddrType::V4);
+        assert_eq!(req.addr, vec![127, 0, 0, 1]);
+        assert_eq!(req.port, 8080);
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_request_domain_roundtrip() {
+        let mut frame = vec![0x05, 0x01, 0x00, 0x03, 11];
+        frame.extend_from_slice(b"example.com");
+        frame.extend_from_slice(&443u16.to_be_bytes());
+        let (req, consumed) = parse_request(&frame).unwrap();
+        assert_eq!(req.addr_type, AddrType::Domain);
+        assert_eq!(req.addr, b"example.com");
+        assert_eq!(req.port, 443);
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_request_rejects_bad_command_and_addr_type() {
+        assert!(matches!(
+            parse_request(&[0x05, 0x09, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
+            Err(MerinoError::Socks(ResponseCode::CommandNotSupported))
+        ));
+        assert!(matches!(
+            parse_request(&[0x05, 0x01, 0x00, 0x02, 0, 0, 0, 0]),
+            Err(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))
+        ));
+    }
+
+    #[test]
+    fn parse_request_truncated_errors() {
+        assert!(parse_request(&[0x05, 0x01, 0x00]).is_err());
+        // claims 4-byte IPv4 but supplies 3
+        assert!(parse_request(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3]).is_err());
+        // full address but no port
+        assert!(parse_request(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00]).is_err());
+        // domain length exceeds body
+        assert!(parse_request(&[0x05, 0x01, 0x00, 0x03, 200, b'a']).is_err());
+    }
+
+    #[test]
+    fn pretty_print_short_addresses_do_not_panic() {
+        assert!(pretty_print_addr(&AddrType::V4, &[1, 2]).contains("invalid"));
+        assert!(pretty_print_addr(&AddrType::V6, &[1, 2, 3]).contains("invalid"));
+    }
+
+    #[test]
+    fn ct_eq_is_equality() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secrez"));
+        assert!(!ct_eq(b"secret", b"secret2"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
     }
 }
