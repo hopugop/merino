@@ -55,6 +55,8 @@ docker image pull ghcr.io/ajmwagar/merino:latest
 merino --no-auth
 
 # Use username/password authentication and read users from users.csv
+cp users.example.csv users.csv && chmod 600 users.csv
+# edit users.csv with real credentials, then start the proxy
 merino --users users.csv
 
 # Display a help menu
@@ -80,8 +82,10 @@ cargo bench
 cargo clippy --all-targets
 ```
 
-See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap and
-[`AGENTS/PLAN.md`](AGENTS/PLAN.md) for the implementation plan.
+See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap,
+[`AGENTS/PLAN.md`](AGENTS/PLAN.md) for the implementation plan, and
+[`AGENTS/HARDENING.md`](AGENTS/HARDENING.md) for the security/hardening plan
+(fuzzing, property tests, Miri, supply-chain checks).
 
 # 🚥 Roadmap
 

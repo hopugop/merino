@@ -46,6 +46,18 @@ jobs:
         with:
           arguments: --all-features
 
+  miri:
+    name: Miri (pure unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri
+        run: cargo +nightly miri test --lib -- --skip addr_to_socket
+
   fuzz:
     name: Fuzz smoke test
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -57,12 +69,12 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Build fuzz targets
-        run: cargo fuzz build
+        run: cargo +nightly fuzz build
       - name: Fuzz parse_greeting
-        run: cargo fuzz run parse_greeting -- -max_total_time=60 -rss_limit_mb=2048
+        run: cargo +nightly fuzz run parse_greeting -- -max_total_time=60 -rss_limit_mb=2048
       - name: Fuzz parse_userpass
-        run: cargo fuzz run parse_userpass -- -max_total_time=60 -rss_limit_mb=2048
+        run: cargo +nightly fuzz run parse_userpass -- -max_total_time=60 -rss_limit_mb=2048
       - name: Fuzz parse_request
-        run: cargo fuzz run parse_request -- -max_total_time=60 -rss_limit_mb=2048
+        run: cargo +nightly fuzz run parse_request -- -max_total_time=60 -rss_limit_mb=2048
       - name: Fuzz pretty_print_addr
-        run: cargo fuzz run pretty_print_addr -- -max_total_time=60 -rss_limit_mb=2048
+        run: cargo +nightly fuzz run pretty_print_addr -- -max_total_time=60 -rss_limit_mb=2048

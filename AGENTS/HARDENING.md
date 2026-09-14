@@ -16,9 +16,8 @@ Each phase is independently committable and verifiable.
 | B — property tests | done | `tests/properties.rs` |
 | C — fuzzing | done | `fuzz/` (4 targets, smoke-run clean) |
 | D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml` |
-| E — dynamic/static hardening | partially | clippy gates in CI; Miri/sanitizers pending |
-| G1–G5 fixes | done | see "Product fixes" below |
-| G6 connection cap, G7 sample creds | open | tracked at the end |
+| E — dynamic/static hardening | mostly | clippy restriction denies + Miri in CI; ASan/TSan pending |
+| G1–G7 fixes | done | see "Product fixes" below |
 
 ## Threat model
 
@@ -128,33 +127,43 @@ Implemented in this branch:
 - G4: USERPASS version `!= 0x01` is rejected.
 - G5: constant-time username/password comparison (`ct_eq`) that inspects the
   whole user list.
+- G6: both backends cap simultaneous connections
+  (`DEFAULT_MAX_CONNECTIONS`, 1024; `set_max_connections` / `--max-connections`).
+  A `tokio::sync::Semaphore` permit is acquired before `accept`, so excess
+  connections wait in the kernel backlog rather than spawning unbounded
+  tasks/actors. Zero is clamped to one.
+- G7: the committed credential file moved to `users.example.csv` with
+  placeholder values; real `/users.csv` is gitignored and the README says to
+  `chmod 600` it. `main.rs` already rejects group/world-readable files.
 
-The protocol parsing was also split into pure `&[u8] -> Result<..>` functions
+Phase E also added `clippy::unwrap_used` / `expect_used` / `panic` as hard
+denies in the library and binary, and a Miri CI job over the pure unit tests.
+
+The protocol parsing was split into pure `&[u8] -> Result<..>` functions
 (`parse_greeting`, `parse_userpass`, `parse_request`, `pretty_print_addr`) so
 both the property tests and the fuzzers exercise the wire format without
 sockets.
 
 ## Remaining open items
 
-- **G6 connection cap / rate limit.** `SocksServer` still spawns one actor per
-  accepted connection with no upper bound. Add a `Semaphore` (or per-IP
-  throttle) before exposing the proxy to an untrusted network.
-- **G7 sample credentials.** `users.csv` in the repo root contains
-  `admin,admin` and `ajmwagar,password`; remove or clearly mark it as an
-  example that must not be deployed.
-- **E follow-ups:** Miri over the pure tests, an ASan/TSan nightly run, denying
-  `clippy::indexing_slicing` / `unwrap_used` / `expect_used`, and a container
-  image scan in CI.
-- **Timing hardening:** `ct_eq` still reveals string length; consider a
+- **Sanitizers.** No ASan/TSan nightly job yet; Miri covers the pure tests but
+  not the async/network paths.
+- **`clippy::indexing_slicing`.** Not yet denied: the parsers and
+  `addr_to_socket` still index slices directly. The length guards plus fuzzing
+  make this safe today, but converting to `get`/array patterns would let the
+  lint be enabled.
+- **Per-IP rate limiting.** The cap is global; a single source can still
+  occupy all slots. A per-IP throttle/ACL belongs with the middleware work.
+- **Timing hardening.** `ct_eq` still reveals string length; consider a
   fixed-length comparison if usernames/passwords are high value.
-
 
 ## Verification
 
 ```bash
 cargo test
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo +nightly miri test --lib -- --skip addr_to_socket
 cargo +nightly fuzz run parse_request   # after cargo install cargo-fuzz
 cargo audit
-cargo deny check
+cargo deny --all-features check
 ```
