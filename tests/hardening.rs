@@ -1,5 +1,6 @@
 mod support;
 
+use actix::Actor;
 use merino::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,4 +258,80 @@ async fn userpass_wrong_version_is_rejected() {
 
     let err = task.await.unwrap().expect_err("handshake should fail");
     assert!(matches!(err, MerinoError::Socks(ResponseCode::Failure)));
+}
+
+#[actix::test]
+async fn actix_connection_cap_throttles_excess_clients() {
+    let mut server = SocksServer::bind(
+        0,
+        "127.0.0.1",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind SocksServer");
+    server.set_max_connections(1);
+    let addr = server.local_addr();
+    server.start();
+
+    // Occupy the only slot: the connection stays in negotiation waiting for
+    // its request, so its permit is held.
+    let mut first = connect(addr).await;
+    assert_eq!(greet(&mut first, &[0x00]).await, 0x00);
+
+    // A second client connects at the TCP level but is not served.
+    let mut second = connect(addr).await;
+    second.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    let throttled = timeout(Duration::from_millis(400), second.read_exact(&mut buf)).await;
+    assert!(
+        throttled.is_err(),
+        "second client must not be served while the cap is reached"
+    );
+
+    // Freeing the slot lets the queued client through.
+    drop(first);
+    timeout(IO_TIMEOUT, second.read_exact(&mut buf))
+        .await
+        .expect("queued client should be served once a slot frees")
+        .unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+}
+
+#[tokio::test]
+async fn merino_connection_cap_throttles_excess_clients() {
+    let mut merino = Merino::new(
+        0,
+        "127.0.0.1",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind Merino");
+    merino.set_max_connections(1);
+    let addr = merino.local_addr().expect("failed to read local addr");
+    tokio::spawn(async move {
+        merino.serve().await;
+    });
+
+    let mut first = connect(addr).await;
+    assert_eq!(greet(&mut first, &[0x00]).await, 0x00);
+
+    let mut second = connect(addr).await;
+    second.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    let throttled = timeout(Duration::from_millis(400), second.read_exact(&mut buf)).await;
+    assert!(
+        throttled.is_err(),
+        "second client must not be served while the cap is reached"
+    );
+
+    drop(first);
+    timeout(IO_TIMEOUT, second.read_exact(&mut buf))
+        .await
+        .expect("queued client should be served once a slot frees")
+        .unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
 }

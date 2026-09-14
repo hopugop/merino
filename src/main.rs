@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), deny(warnings))]
 #![warn(clippy::all)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[macro_use]
 extern crate log;
 
@@ -52,6 +53,10 @@ struct Opt {
     #[arg(short, long)]
     /// CSV File with username/password pairs
     users: Option<PathBuf>,
+
+    /// Maximum number of simultaneous client connections
+    #[arg(long, default_value_t = merino::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
 
     /// Log verbosity level. -vv for more verbosity.
     /// Environmental variable `RUST_LOG` overrides this flag!
@@ -172,13 +177,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Start the actix system and the proxy server actor. The actor must be
     // created from inside the system's runtime context.
     let sys = actix::System::new();
-    let server = sys.block_on(SocksServer::bind(
+    let mut server = sys.block_on(SocksServer::bind(
         opt.port,
         &opt.ip,
         auth_methods,
         authed_users,
         None,
     ))?;
+    server.set_max_connections(opt.max_connections);
     sys.block_on(async move {
         server.start();
     });

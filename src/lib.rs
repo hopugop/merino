@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -16,12 +17,20 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 /// Version of socks
 const SOCKS_VERSION: u8 = 0x05;
 
 const RESERVED: u8 = 0x00;
+
+/// Default maximum number of client connections handled at once.
+///
+/// Accepted connections beyond this limit wait in the accept loop until a
+/// slot frees, applying kernel-level backpressure instead of spawning an
+/// unbounded number of tasks/actors.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 /// Default time budget for the whole SOCKS5 handshake (greeting + auth) before
 /// the server gives up on a slow or stalled client. Protects against
@@ -274,6 +283,7 @@ pub struct Merino {
     auth_methods: Arc<Vec<u8>>,
     // Timeout for connections
     timeout: Option<Duration>,
+    max_connections: usize,
 }
 
 impl Merino {
@@ -290,7 +300,15 @@ impl Merino {
             auth_methods: Arc::new(auth_methods),
             users: Arc::new(users),
             timeout,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         })
+    }
+
+    /// Set the maximum number of simultaneous client connections.
+    ///
+    /// Zero is clamped to one so the accept loop can never deadlock.
+    pub fn set_max_connections(&mut self, max: usize) {
+        self.max_connections = max.max(1);
     }
 
     /// Return the first address a listener is bound to
@@ -309,13 +327,19 @@ impl Merino {
     pub async fn serve(&mut self) {
         info!("Serving Connections...");
         let listeners = std::mem::take(&mut self.listeners);
+        let semaphore = Arc::new(Semaphore::new(self.max_connections));
         let mut set = tokio::task::JoinSet::new();
         for listener in listeners {
             let users = self.users.clone();
             let auth_methods = self.auth_methods.clone();
             let timeout = self.timeout;
+            let semaphore = semaphore.clone();
             set.spawn(async move {
                 loop {
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
                     match listener.accept().await {
                         Ok((stream, client_addr)) => {
                             let client = SOCKClient::new(
@@ -324,9 +348,15 @@ impl Merino {
                                 auth_methods.clone(),
                                 timeout,
                             );
-                            tokio::spawn(run_client(client, client_addr));
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                run_client(client, client_addr).await;
+                            });
                         }
-                        Err(e) => warn!("Accept error: {:?}", e),
+                        Err(e) => {
+                            warn!("Accept error: {:?}", e);
+                            drop(permit);
+                        }
                     }
                 }
             });
@@ -1018,6 +1048,7 @@ impl SOCKSReq {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
