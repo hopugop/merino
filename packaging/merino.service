@@ -1,0 +1,66 @@
+[Unit]
+Description=Merino SOCKS5 proxy
+Documentation=https://github.com/ajmwagar/merino
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Launch ---
+# `cargo install merino` drops the binary at %h/.cargo/bin/merino.
+# Change this path if you installed it elsewhere (e.g. /usr/local/bin/merino).
+ExecStart=%h/.cargo/bin/merino --no-auth --ip 127.0.0.1 --port 1080
+
+# Username/password auth instead of --no-auth (the file must not be group- or
+# world-readable; see the UMask/install notes below). Only one ExecStart may be
+# active, so comment the line above before enabling this one:
+# ExecStart=%h/.cargo/bin/merino --users %h/.config/merino/users.csv --ip 127.0.0.1 --port 1080
+
+Environment=RUST_LOG=merino=info
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+
+# --- Hardening ---
+# PrivateDevices/ProtectKernelModules/ProtectKernelLogs/ProtectClock force
+# systemd to drop capabilities. On a host whose user manager cannot do that
+# (VM/container with a seccomp or AppArmor policy, common on Ubuntu), the unit
+# aborts with status=218/CAPABILITIES ("Failed to drop capabilities: Operation
+# not permitted"). Remove those four directives on such a host; everything else
+# below is unaffected. They are fine on a stock desktop systemd.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+# NOTE: do NOT add CapabilityBoundingSet= here. In a --user unit systemd tries
+# to drop the bounding set and fails with `status=218/CAPABILITIES`
+# ("Failed to drop capabilities: Operation not permitted"), aborting the
+# service. A user service is already unprivileged, so it is redundant anyway.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# AF_INET/AF_INET6 for the listener and upstream CONNECTs; AF_UNIX for nscd
+# (glibc name resolution). A proxy reaches arbitrary hosts, so no
+# IPAddressAllow/Deny filtering is appropriate here.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target
