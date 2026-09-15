@@ -23,6 +23,16 @@ const SOCKS_VERSION: u8 = 0x05;
 
 const RESERVED: u8 = 0x00;
 
+/// Default time budget for establishing the outbound TCP connection to the
+/// requested destination.
+///
+/// This bounds only connection establishment, never the relay that follows, so
+/// a long-lived proxied connection is unaffected once it is up. When no timeout
+/// is configured this is used instead of the previous 500 ms fallback, which was
+/// too short for any destination beyond the local network and was misreported as
+/// a connection refusal.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct User {
     pub username: String,
@@ -538,11 +548,7 @@ where
 
                 trace!("Connecting to: {:?}", sock_addr);
 
-                let time_out = if let Some(time_out) = self.timeout {
-                    time_out
-                } else {
-                    Duration::from_millis(500)
-                };
+                let time_out = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
                 let mut target =
                     timeout(
@@ -550,7 +556,7 @@ where
                         async move { TcpStream::connect(&sock_addr[..]).await },
                     )
                     .await
-                    .map_err(|_| MerinoError::Socks(ResponseCode::ConnectionRefused))?
+                    .map_err(|_| connect_timeout_error())?
                     .map_err(|e| match e.kind() {
                         io::ErrorKind::ConnectionRefused => {
                             MerinoError::Socks(ResponseCode::ConnectionRefused)
@@ -592,6 +598,16 @@ where
         }
         Ok(methods)
     }
+}
+
+/// Error reported when the bounded outbound connect attempt runs out of time.
+///
+/// A timeout is not the same as the peer refusing the connection, so it is
+/// reported as `TTL expired` (RFC 1928 §6) rather than `connection refused`.
+/// This lets a client tell a blackholed or merely slow destination apart from
+/// one that is actively rejecting the connection.
+fn connect_timeout_error() -> MerinoError {
+    MerinoError::Socks(ResponseCode::TtlExpired)
 }
 
 /// Convert an address and AddrType to a SocketAddr
@@ -860,6 +876,21 @@ mod tests {
 
         let io: ResponseCode = MerinoError::Io(io::Error::other("boom")).into();
         assert_eq!(io as u8, ResponseCode::Failure as u8);
+    }
+
+    #[test]
+    fn default_connect_timeout_is_reasonable() {
+        // Guards against reintroducing the old 500 ms fallback, which was too
+        // short for any destination beyond the local network.
+        assert!(DEFAULT_CONNECT_TIMEOUT >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connect_timeout_maps_to_ttl_expired() {
+        assert!(matches!(
+            connect_timeout_error(),
+            MerinoError::Socks(ResponseCode::TtlExpired)
+        ));
     }
 
     #[tokio::test]
