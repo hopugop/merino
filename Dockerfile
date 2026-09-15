@@ -5,6 +5,7 @@ RUN apk add --no-cache build-base
 WORKDIR /app/
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 
 # Cache the registry download and the compiled target dir across builds so
 # dependency crates are not recompiled on every source change. The binary is
