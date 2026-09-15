@@ -1,6 +1,6 @@
 [Unit]
 Description=Merino SOCKS5 proxy
-Documentation=https://github.com/ajmwagar/merino
+Documentation=https://github.com/hopugop/merino
 After=network-online.target
 Wants=network-online.target
 

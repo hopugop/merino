@@ -10,8 +10,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/merino.svg)](https://crates.io/crates/merino)
 [![stego](https://docs.rs/merino/badge.svg)](https://docs.rs/merino)
-[![License](https://img.shields.io/crates/l/pbr.svg)](https://github.com/ajmwagar/merino/blob/master/LICENSE.md)
-[![dependency status](https://deps.rs/repo/github/ajmwagar/merino/status.svg)](https://deps.rs/repo/github/ajmwagar/merino)
+[![License](https://img.shields.io/crates/l/merino.svg)](https://github.com/hopugop/merino/blob/master/LICENSE.md)
+[![dependency status](https://deps.rs/repo/github/hopugop/merino/status.svg)](https://deps.rs/repo/github/hopugop/merino)
 
 ## 🎁 Features
 
@@ -37,7 +37,7 @@ cargo install merino
 OR
 
 ```bash
-git clone https://github.com/ajmwagar/merino
+git clone https://github.com/hopugop/merino
 cd merino
 cargo install --path .
 ```
@@ -45,7 +45,7 @@ cargo install --path .
 OR
 
 ```bash
-docker image pull ghcr.io/ajmwagar/merino:latest
+docker image pull ghcr.io/hopugop/merino:latest
 ```
 
 ### Usage
@@ -64,7 +64,7 @@ merino --help
 OR
 
 ```bash
-docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/ajmwagar/merino:latest --no-auth --port=8001
+docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/hopugop/merino:latest --no-auth --port=8001
 ```
 
 ## 🧪 Development
