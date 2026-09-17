@@ -12,6 +12,9 @@
 /lcov.info
 /coverage/
 
+# Local-only deploy tooling (host inventory, playbooks)
+/ansible/
+
 
 #Added by cargo
 #
