@@ -26,6 +26,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+proptest = "1.11.0"
 
 [[bench]]
 name = "proxy"
