@@ -8,6 +8,10 @@
 # Real credential files must never be committed. Copy users.example.csv.
 /users.csv
 
+# Coverage reports (cargo-llvm-cov)
+/lcov.info
+/coverage/
+
 
 #Added by cargo
 #

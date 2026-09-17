@@ -80,6 +80,10 @@ cargo bench
 
 # Lints
 cargo clippy --all-targets
+
+# Code coverage (HTML report in target/llvm-cov/html; install once with
+# `cargo install cargo-llvm-cov`)
+cargo llvm-cov --all-targets --html
 ```
 
 See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap,

@@ -1286,4 +1286,72 @@ mod tests {
         assert!(!ct_eq(b"", b"x"));
         assert!(ct_eq(b"", b""));
     }
+
+    #[tokio::test]
+    async fn new_no_auth_builds_client() {
+        let (_peer, stream) = tokio::io::duplex(64);
+        let mut client = SOCKClient::new_no_auth(stream, Some(Duration::from_secs(1)));
+        assert_eq!(client.auth_nmethods, 0);
+        assert_eq!(client.socks_version, 0);
+        assert_eq!(client.auth_methods.as_slice(), &[AuthMethods::NoAuth as u8]);
+        let _ = client.stream_mut();
+    }
+
+    #[tokio::test]
+    async fn addr_to_socket_rejects_short_addresses() {
+        assert!(addr_to_socket(&AddrType::V4, &[1, 2, 3], 0).await.is_err());
+        assert!(addr_to_socket(&AddrType::V6, &[0u8; 15], 0).await.is_err());
+    }
+
+    #[test]
+    fn parse_request_truncated_domain_and_v6() {
+        // domain ATYP with no length byte
+        assert!(parse_request(&[0x05, 0x01, 0x00, 0x03]).is_err());
+        // IPv6 ATYP with a short address
+        assert!(parse_request(&[0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_client_reads_and_rejects_bind() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let mut client = SOCKClient::new_no_auth(stream, None);
+        let frame = [0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
+        peer.write_all(&frame).await.unwrap();
+        let err = client.handle_client().await.unwrap_err();
+        assert!(matches!(
+            err,
+            MerinoError::Socks(ResponseCode::CommandNotSupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn from_stream_rejects_unsupported_version() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        peer.write_all(&[0x04, 0x01, 0x00, 0x01]).await.unwrap();
+        let mut stream = stream;
+        let err = SOCKSReq::from_stream(&mut stream).await.unwrap_err();
+        assert!(matches!(err, MerinoError::Socks(ResponseCode::Failure)));
+    }
+
+    #[tokio::test]
+    async fn from_stream_parses_ipv6_request() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let mut frame = vec![0x05, 0x01, 0x00, 0x04];
+        frame.extend_from_slice(&[0u8; 16]);
+        frame.extend_from_slice(&[0x00, 0x50]);
+        peer.write_all(&frame).await.unwrap();
+        let mut stream = stream;
+        let req = SOCKSReq::from_stream(&mut stream).await.unwrap();
+        assert_eq!(req.addr_type, AddrType::V6);
+        assert_eq!(req.addr.len(), 16);
+        assert_eq!(req.port, 80);
+    }
+
+    #[tokio::test]
+    async fn bind_all_reports_bind_failure() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let err = bind_all("127.0.0.1", port).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
 }

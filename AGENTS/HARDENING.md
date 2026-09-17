@@ -17,6 +17,7 @@ Each phase is independently committable and verifiable.
 | C — fuzzing | done | `fuzz/` (4 targets, smoke-run clean) |
 | D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml` |
 | E — dynamic/static hardening | mostly | clippy restriction denies + Miri in CI; ASan/TSan pending |
+| F — code coverage | done | `cargo-llvm-cov`, `coverage` job in `.github/workflows/security.yml` |
 | G1–G7 fixes | done | see "Product fixes" below |
 
 ## Threat model
@@ -112,6 +113,32 @@ cargo +nightly fuzz run parse_greeting -- -max_total_time=60
 - `systemd-analyze security packaging/merino.service` and a container image
   scan (`trivy`/`grype`) in CI.
 
+### Phase F — Code coverage
+
+Line/region coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov),
+which runs on the pinned stable toolchain (the `llvm-tools-preview` component
+is declared in `rust-toolchain.toml`). The library and binary are instrumented;
+the `fuzz` crate is a separate workspace and is measured separately.
+
+```bash
+cargo install cargo-llvm-cov --locked   # once
+cargo llvm-cov --locked --all-targets --html   # HTML in target/llvm-cov/html
+```
+
+Baseline before this phase was 82.79% of lines (88.67% of regions) with
+`src/main.rs` at 0% because all of its logic lived in `main` behind
+`std::process::exit`. The CLI argument/auth selection and CSV user loading were
+extracted into `log_level_for`, `select_auth_methods`, and `load_users` so they
+are unit-testable without spawning a process. Coverage is now roughly 92% of
+lines (89% of regions) across `src/{lib,actors,main}.rs`; the remaining
+uncovered lines are defensive error paths (accept failures, `copy_bidirectional`
+errors) and the `main` entry point itself, which is only exercised by running
+the binary.
+
+CI runs coverage in its own `coverage` job and uploads `lcov.info` plus the
+HTML report as a build artifact. It is informational only — no threshold gate
+yet, so it cannot fail a PR on a coverage regression.
+
 ## Product fixes driven by these tests
 
 Implemented in this branch:
@@ -162,6 +189,7 @@ sockets.
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo llvm-cov --all-targets --html          # after cargo install cargo-llvm-cov
 cargo +nightly miri test --lib -- --skip addr_to_socket
 cargo +nightly fuzz run parse_request   # after cargo install cargo-fuzz
 cargo audit
