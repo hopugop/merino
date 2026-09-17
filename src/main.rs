@@ -211,10 +211,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn write_temp_csv(name: &str, contents: &str, mode: u32) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "merino-test-{}-{name}.csv",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("merino-test-{}-{name}.csv", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
