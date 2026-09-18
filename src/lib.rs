@@ -11,12 +11,12 @@ pub use actors::{SocksConnection, SocksServer};
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
@@ -95,29 +95,46 @@ pub struct SocksReply {
     //      o  BND.ADDR       server bound address
     //      o  BND.PORT       server bound port in network octet order
     //
-    buf: [u8; 10],
+    buf: Vec<u8>,
 }
 
 impl SocksReply {
+    /// Build a reply with an all-zero `BND.ADDR` / `BND.PORT`.
+    ///
+    /// Used for `CONNECT` and for error replies, where no server-bound address
+    /// is meaningful.
     pub fn new(status: ResponseCode) -> Self {
-        let buf = [
-            // VER
-            SOCKS_VERSION,
-            // REP
-            status as u8,
-            // RSV
-            RESERVED,
-            // ATYP
-            1,
-            // BND.ADDR
-            0,
-            0,
-            0,
-            0,
-            // BND.PORT
-            0,
-            0,
-        ];
+        Self::from_bound(status, None)
+    }
+
+    /// Build a reply advertising the server-bound address `bound`, as required
+    /// by the first `BIND` and `UDP ASSOCIATE` replies (RFC 1928 §6).
+    pub fn with_addr(status: ResponseCode, bound: SocketAddr) -> Self {
+        Self::from_bound(status, Some(bound))
+    }
+
+    fn from_bound(status: ResponseCode, bound: Option<SocketAddr>) -> Self {
+        let mut buf = Vec::with_capacity(22);
+        buf.push(SOCKS_VERSION);
+        buf.push(status as u8);
+        buf.push(RESERVED);
+        match bound {
+            Some(SocketAddr::V4(addr)) => {
+                buf.push(AddrType::V4 as u8);
+                buf.extend_from_slice(&addr.ip().octets());
+                buf.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            Some(SocketAddr::V6(addr)) => {
+                buf.push(AddrType::V6 as u8);
+                buf.extend_from_slice(&addr.ip().octets());
+                buf.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            None => {
+                buf.push(AddrType::V4 as u8);
+                buf.extend_from_slice(&[0, 0, 0, 0]);
+                buf.extend_from_slice(&[0, 0]);
+            }
+        }
         Self { buf }
     }
 
@@ -129,8 +146,8 @@ impl SocksReply {
         Ok(())
     }
 
-    /// The raw 10-byte wire representation of this reply.
-    pub fn as_bytes(&self) -> &[u8; 10] {
+    /// The raw wire representation of this reply.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
 }
@@ -352,12 +369,14 @@ impl Merino {
                     };
                     match listener.accept().await {
                         Ok((stream, client_addr)) => {
-                            let client = SOCKClient::new(
+                            let local_addr = stream.local_addr().ok();
+                            let mut client = SOCKClient::new(
                                 stream,
                                 users.clone(),
                                 auth_methods.clone(),
                                 timeout,
                             );
+                            client.set_local_addr(local_addr);
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 run_client(client, client_addr).await;
@@ -405,6 +424,9 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     socks_version: u8,
     timeout: Option<Duration>,
     handshake_timeout: Duration,
+    /// Local address of the client-facing connection, when known. Used as the
+    /// interface to bind `BIND` listeners and `UDP ASSOCIATE` sockets on.
+    local_addr: Option<SocketAddr>,
 }
 
 impl<T> SOCKClient<T>
@@ -426,6 +448,7 @@ where
             auth_methods,
             timeout,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            local_addr: None,
         }
     }
 
@@ -443,7 +466,17 @@ where
             auth_methods,
             timeout,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            local_addr: None,
         }
+    }
+
+    /// Record the local address of the client-facing connection.
+    ///
+    /// `BIND` and `UDP ASSOCIATE` bind their listeners on the same interface
+    /// the client reached the proxy through, so the advertised `BND.ADDR` is
+    /// reachable.
+    pub fn set_local_addr(&mut self, local_addr: Option<SocketAddr>) {
+        self.local_addr = local_addr;
     }
 
     /// Override the maximum time allowed for the SOCKS5 handshake.
@@ -688,9 +721,173 @@ where
                     Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
                 }
             }
-            SockCommand::Bind => Err(MerinoError::Socks(ResponseCode::CommandNotSupported)),
-            SockCommand::UdpAssosiate => Err(MerinoError::Socks(ResponseCode::CommandNotSupported)),
+            // Listen for a single inbound connection and relay it back.
+            SockCommand::Bind => self.handle_bind(&req).await,
+            // Relay UDP datagrams for the lifetime of the control connection.
+            SockCommand::UdpAssosiate => self.handle_udp_associate(&req).await,
         }
+    }
+
+    /// Interface the `BIND` / `UDP ASSOCIATE` sockets should be bound to.
+    ///
+    /// Prefers the local address of the client-facing connection so the
+    /// advertised `BND.ADDR` is reachable by the client; falls back to the
+    /// unspecified IPv4 address when it is unknown.
+    fn local_interface(&self) -> IpAddr {
+        self.local_addr
+            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip())
+    }
+
+    /// Handle a `BIND` request (RFC 1928 §4).
+    ///
+    /// Binds an ephemeral listener on the proxy interface, replies with its
+    /// address, waits for the anticipated inbound connection and then relays
+    /// between it and the client until either side closes.
+    async fn handle_bind(&mut self, req: &SOCKSReq) -> Result<usize, MerinoError> {
+        debug!("Handling BIND Command");
+
+        let listener = TcpListener::bind(SocketAddr::new(self.local_interface(), 0)).await?;
+        let bound = listener.local_addr()?;
+        info!("BIND listening on {}", bound);
+
+        SocksReply::with_addr(ResponseCode::Success, bound)
+            .send(&mut self.stream)
+            .await?;
+
+        let time_out = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let (mut inbound, peer) = match timeout(time_out, listener.accept()).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(MerinoError::Io(e)),
+            Err(_) => return Err(connect_timeout_error()),
+        };
+        trace!("BIND inbound connection from {}", peer);
+
+        // Validate the client's expected peer when it supplied a concrete
+        // address; 0.0.0.0 / :: means "any".
+        if let Some(expected) = expected_ip(&req.addr_type, &req.addr)
+            && expected != peer.ip()
+        {
+            warn!("BIND peer {} does not match requested {}", peer, expected);
+            return Err(MerinoError::Socks(ResponseCode::RuleFailure));
+        }
+
+        // Second reply carries the address of the connected peer.
+        SocksReply::with_addr(ResponseCode::Success, peer)
+            .send(&mut self.stream)
+            .await?;
+
+        trace!("BIND relay");
+        match tokio::io::copy_bidirectional(&mut self.stream, &mut inbound).await {
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => {
+                trace!("already closed");
+                Ok(0)
+            }
+            Err(e) => Err(MerinoError::Io(e)),
+            Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
+        }
+    }
+
+    /// Handle a `UDP ASSOCIATE` request (RFC 1928 §7).
+    ///
+    /// Binds an ephemeral UDP socket on the proxy interface, replies with its
+    /// address, then relays datagrams between the client and their destinations
+    /// until the TCP control connection closes.
+    async fn handle_udp_associate(&mut self, req: &SOCKSReq) -> Result<usize, MerinoError> {
+        debug!("Handling UDP ASSOCIATE Command");
+
+        let socket = UdpSocket::bind(SocketAddr::new(self.local_interface(), 0)).await?;
+        let bound = socket.local_addr()?;
+        info!("UDP ASSOCIATE bound to {}", bound);
+
+        SocksReply::with_addr(ResponseCode::Success, bound)
+            .send(&mut self.stream)
+            .await?;
+
+        let expected_client = expected_ip(&req.addr_type, &req.addr);
+        let mut client_addr: Option<SocketAddr> = None;
+        let mut buf = vec![0u8; 65535];
+        let mut control = [0u8; 1];
+
+        loop {
+            tokio::select! {
+                read = self.stream.read(&mut control) => match read {
+                    // EOF or a read error on the control channel tears the
+                    // association down.
+                    Ok(0) | Err(_) => {
+                        debug!("UDP control connection closed");
+                        break;
+                    }
+                    // Any data on the control channel is ignored.
+                    Ok(_) => continue,
+                },
+                recv = socket.recv_from(&mut buf) => {
+                    let (n, src) = match recv {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("UDP recv error: {}", e);
+                            break;
+                        }
+                    };
+                    let data = &buf[..n];
+
+                    match client_addr {
+                        None => {
+                            // The first datagram identifies the client, unless
+                            // it contradicts the address the client declared.
+                            if let Some(expected) = expected_client
+                                && expected != src.ip()
+                            {
+                                warn!(
+                                    "UDP datagram from unexpected source {}, expected {}",
+                                    src, expected
+                                );
+                                continue;
+                            }
+                            client_addr = Some(src);
+                        }
+                        Some(client) if client == src => {}
+                        Some(client) => {
+                            // A reply from a remote destination: re-frame it
+                            // with the sender's address and forward to client.
+                            let mut out = encode_udp_header(src);
+                            out.extend_from_slice(data);
+                            if let Err(e) = socket.send_to(&out, client).await {
+                                warn!("UDP relay to client failed: {}", e);
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Datagram from the client: forward the payload on.
+                    let (header, consumed) = match parse_udp_header(data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            warn!("Invalid UDP header: {:?}", e);
+                            continue;
+                        }
+                    };
+                    if header.frag != 0 {
+                        warn!("UDP fragmentation unsupported (FRAG={})", header.frag);
+                        continue;
+                    }
+                    let target =
+                        match addr_to_socket(&header.addr_type, header.addr, header.port).await {
+                            Ok(addrs) => addrs,
+                            Err(e) => {
+                                warn!("UDP destination resolution failed: {}", e);
+                                continue;
+                            }
+                        };
+                    if let Some(dest) = target.first()
+                        && let Err(e) = socket.send_to(&data[consumed..], *dest).await
+                    {
+                        warn!("UDP forward to {} failed: {}", dest, e);
+                    }
+                }
+            }
+        }
+
+        Ok(0)
     }
 
     /// Return the avalible methods based on `self.auth_nmethods`
@@ -804,6 +1001,117 @@ pub fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
                 .join(":")
         }
     }
+}
+
+/// Extract a concrete IP from a request address, or `None` when the address is
+/// a domain or the unspecified address (`0.0.0.0` / `::`), meaning "any".
+fn expected_ip(addr_type: &AddrType, addr: &[u8]) -> Option<IpAddr> {
+    match addr_type {
+        AddrType::V4 if addr.len() >= 4 => {
+            let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+            (!ip.is_unspecified()).then_some(IpAddr::V4(ip))
+        }
+        AddrType::V6 if addr.len() >= 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&addr[..16]);
+            let ip = Ipv6Addr::from(octets);
+            (!ip.is_unspecified()).then_some(IpAddr::V6(ip))
+        }
+        _ => None,
+    }
+}
+
+/// A parsed RFC 1928 §7 UDP request header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpRequest<'a> {
+    pub frag: u8,
+    pub addr_type: AddrType,
+    pub addr: &'a [u8],
+    pub port: u16,
+}
+
+/// Parse a SOCKS5 UDP request header
+/// (`RSV, RSV, FRAG, ATYP, DST.ADDR, DST.PORT`) from a byte slice.
+///
+/// Returns the header and the number of bytes consumed; the remaining bytes are
+/// the datagram payload.
+pub fn parse_udp_header(bytes: &[u8]) -> Result<(UdpRequest<'_>, usize), MerinoError> {
+    if bytes.len() < 4 {
+        return Err(truncated());
+    }
+    let frag = bytes[2];
+    let addr_type = AddrType::from(bytes[3] as usize)
+        .ok_or(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))?;
+
+    let mut pos = 4;
+    let addr: &[u8] = match addr_type {
+        AddrType::Domain => {
+            if bytes.len() < pos + 1 {
+                return Err(truncated());
+            }
+            let dlen = usize::from(bytes[pos]);
+            pos += 1;
+            if bytes.len() < pos + dlen {
+                return Err(truncated());
+            }
+            let addr = &bytes[pos..pos + dlen];
+            pos += dlen;
+            addr
+        }
+        AddrType::V4 => {
+            if bytes.len() < pos + 4 {
+                return Err(truncated());
+            }
+            let addr = &bytes[pos..pos + 4];
+            pos += 4;
+            addr
+        }
+        AddrType::V6 => {
+            if bytes.len() < pos + 16 {
+                return Err(truncated());
+            }
+            let addr = &bytes[pos..pos + 16];
+            pos += 16;
+            addr
+        }
+    };
+
+    if bytes.len() < pos + 2 {
+        return Err(truncated());
+    }
+    let port = (u16::from(bytes[pos]) << 8) | u16::from(bytes[pos + 1]);
+    pos += 2;
+
+    Ok((
+        UdpRequest {
+            frag,
+            addr_type,
+            addr,
+            port,
+        },
+        pos,
+    ))
+}
+
+/// Encode an RFC 1928 §7 UDP request header for `addr` with `FRAG = 0`.
+pub fn encode_udp_header(addr: SocketAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(22);
+    buf.push(RESERVED);
+    buf.push(RESERVED);
+    buf.push(0);
+    match addr {
+        SocketAddr::V4(addr) => {
+            buf.push(AddrType::V4 as u8);
+            buf.extend_from_slice(&addr.ip().octets());
+            buf.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        SocketAddr::V6(addr) => {
+            buf.push(AddrType::V6 as u8);
+            buf.extend_from_slice(&addr.ip().octets());
+            buf.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+    buf
 }
 
 /// Proxy User Request
@@ -1342,17 +1650,100 @@ mod tests {
         assert!(parse_request(&[0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0]).is_err());
     }
 
-    #[tokio::test]
-    async fn handle_client_reads_and_rejects_bind() {
-        let (mut peer, stream) = tokio::io::duplex(64);
-        let mut client = SOCKClient::new_no_auth(stream, None);
-        let frame = [0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
-        peer.write_all(&frame).await.unwrap();
-        let err = client.handle_client().await.unwrap_err();
+    #[test]
+    fn socks_reply_with_ipv4_bound_addr() {
+        let reply = SocksReply::with_addr(
+            ResponseCode::Success,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 4321)),
+        );
+        let port = 4321u16.to_be_bytes();
+        assert_eq!(
+            reply.as_bytes(),
+            &[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, port[0], port[1]]
+        );
+    }
+
+    #[test]
+    fn socks_reply_with_ipv6_bound_addr() {
+        let reply = SocksReply::with_addr(
+            ResponseCode::Success,
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                443,
+                0,
+                0,
+            )),
+        );
+        assert_eq!(reply.as_bytes().len(), 22);
+        assert_eq!(reply.as_bytes()[0], 0x05);
+        assert_eq!(reply.as_bytes()[1], 0x00);
+        assert_eq!(reply.as_bytes()[3], 0x04);
+        assert_eq!(&reply.as_bytes()[4..20], &[0x20, 0x01, 0x0d, 0xb8, 0,0,0,0,0,0,0,0,0,0,0,1]);
+        assert_eq!(&reply.as_bytes()[20..22], &443u16.to_be_bytes());
+    }
+
+    #[test]
+    fn parse_udp_header_ipv4() {
+        let frame = [0, 0, 0, 0x01, 127, 0, 0, 1, 0x1F, 0x90, b'h', b'i'];
+        let (header, consumed) = parse_udp_header(&frame).unwrap();
+        assert_eq!(header.frag, 0);
+        assert_eq!(header.addr_type, AddrType::V4);
+        assert_eq!(header.addr, &[127, 0, 0, 1]);
+        assert_eq!(header.port, 8080);
+        assert_eq!(consumed, 10);
+        assert_eq!(&frame[consumed..], b"hi");
+    }
+
+    #[test]
+    fn parse_udp_header_domain_and_frag() {
+        let mut frame = vec![0, 0, 0x03, 0x03, 11];
+        frame.extend_from_slice(b"example.com");
+        frame.extend_from_slice(&443u16.to_be_bytes());
+        let (header, consumed) = parse_udp_header(&frame).unwrap();
+        assert_eq!(header.frag, 0x03);
+        assert_eq!(header.addr_type, AddrType::Domain);
+        assert_eq!(header.addr, b"example.com");
+        assert_eq!(header.port, 443);
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_udp_header_rejects_truncated_and_bad_type() {
+        assert!(parse_udp_header(&[]).is_err());
+        assert!(parse_udp_header(&[0, 0, 0]).is_err());
+        // ATYP 0x02 is reserved
         assert!(matches!(
-            err,
-            MerinoError::Socks(ResponseCode::CommandNotSupported)
+            parse_udp_header(&[0, 0, 0, 0x02]),
+            Err(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))
         ));
+        // claims IPv4 but only 3 address bytes
+        assert!(parse_udp_header(&[0, 0, 0, 0x01, 1, 2, 3]).is_err());
+        // address present but no port
+        assert!(parse_udp_header(&[0, 0, 0, 0x01, 127, 0, 0, 1, 0x00]).is_err());
+    }
+
+    #[test]
+    fn encode_udp_header_roundtrips() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9000));
+        let encoded = encode_udp_header(addr);
+        assert_eq!(encoded[0], 0);
+        assert_eq!(encoded[1], 0);
+        assert_eq!(encoded[2], 0);
+        let (header, consumed) = parse_udp_header(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(header.addr, &[127, 0, 0, 1]);
+        assert_eq!(header.port, 9000);
+    }
+
+    #[test]
+    fn expected_ip_only_accepts_concrete_addresses() {
+        assert_eq!(
+            expected_ip(&AddrType::V4, &[127, 0, 0, 1]),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(expected_ip(&AddrType::V4, &[0, 0, 0, 0]), None);
+        assert_eq!(expected_ip(&AddrType::Domain, b"example.com"), None);
+        assert_eq!(expected_ip(&AddrType::V4, &[1, 2]), None);
     }
 
     #[tokio::test]

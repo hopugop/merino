@@ -137,12 +137,14 @@ impl Actor for SocksServer {
                     };
                     match listener.accept().await {
                         Ok((stream, peer)) => {
-                            let client = SOCKClient::new(
+                            let local_addr = stream.local_addr().ok();
+                            let mut client = SOCKClient::new(
                                 stream,
                                 users.clone(),
                                 auth_methods.clone(),
                                 timeout,
                             );
+                            client.set_local_addr(local_addr);
                             SocksConnection::create(move |_| {
                                 let mut connection = SocksConnection::new(client, peer);
                                 connection.set_permit(permit);

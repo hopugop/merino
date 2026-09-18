@@ -20,8 +20,8 @@ Current state (from `README.md` and `src/lib.rs`):
 - `[x]` `CONNECT`
 - `[ ]` `GSSAPI`
 - `[ ]` Custom plugin / middleware support
-- `[ ]` `BIND`
-- `[ ]` `UDP ASSOCIATE`
+- `[x]` `BIND`
+- `[x]` `UDP ASSOCIATE`
 - `[x]` Benchmarks & unit tests
 - `[x]` Actix-based backend
 - `[ ]` `SOCKS4` / `SOCKS4a` support
@@ -108,6 +108,12 @@ plan) and ideally the actix backend so hooks compose with actor state.
 
 ## 3. `BIND` command (`0x02`)
 
+**Status: complete.** `SOCKClient::handle_bind` binds an ephemeral listener on
+the client-facing interface, returns the two RFC 1928 replies with real
+`BND.ADDR`/`BND.PORT`, validates the anticipated peer when a concrete address
+was supplied, and relays with `copy_bidirectional`. Covered by
+`bind_relays_an_inbound_connection` on both backends.
+
 **Goal.** Implement the `BIND` request used by protocols that need the proxy to
 listen for an inbound connection (historically FTP active mode).
 
@@ -131,6 +137,13 @@ listen for an inbound connection (historically FTP active mode).
 ---
 
 ## 4. `UDP ASSOCIATE` command (`0x03`)
+
+**Status: complete.** `SOCKClient::handle_udp_associate` binds an ephemeral UDP
+socket, returns its address, and relays datagrams using the RFC 1928 §7 header
+(parsed by `parse_udp_header`). The client's address is learned from the first
+datagram (or validated against the request), `FRAG != 0` is dropped, and the
+association ends when the TCP control connection closes. Covered by
+`udp_associate_relays_datagrams` and `udp_associate_drops_fragmented_datagrams`.
 
 **Goal.** Implement UDP relay so clients can send datagrams through the proxy
 (DNS, QUIC, WebRTC, etc.).

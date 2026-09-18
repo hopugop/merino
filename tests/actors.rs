@@ -5,7 +5,7 @@ use merino::*;
 use std::net::SocketAddr;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 
 async fn start_actors(auth_methods: Vec<u8>, users: Vec<User>) -> SocketAddr {
@@ -158,15 +158,51 @@ async fn connect_to_dead_port_is_refused() {
 }
 
 #[actix::test]
-async fn bind_command_is_not_supported() {
+async fn bind_relays_an_inbound_connection() {
     let addr = start_actors_no_auth().await;
-    let mut stream = connect(addr).await;
+    let mut control = connect(addr).await;
 
-    assert_eq!(greet(&mut stream, &[0x00]).await, 0x00);
-    assert_eq!(
-        request_ipv4(&mut stream, 0x02, [127, 0, 0, 1], 0).await,
-        0x07
-    );
+    assert_eq!(greet(&mut control, &[0x00]).await, 0x00);
+    let first = send_request_ipv4(&mut control, 0x02, [127, 0, 0, 1], 0).await;
+    assert_eq!(first[1], 0x00);
+    let (bnd_ip, bnd_port) = parse_bnd(&first);
+
+    let mut peer = connect(SocketAddr::new(bnd_ip.into(), bnd_port)).await;
+    assert_eq!(read_reply(&mut control).await[1], 0x00);
+
+    peer.write_all(b"actors peer").await.unwrap();
+    let mut buf = [0u8; 11];
+    timeout(IO_TIMEOUT, control.read_exact(&mut buf))
+        .await
+        .expect("bind relay timed out")
+        .unwrap();
+    assert_eq!(&buf, b"actors peer");
+}
+
+#[actix::test]
+async fn udp_associate_relays_datagrams() {
+    let echo = spawn_udp_echo().await;
+    let addr = start_actors_no_auth().await;
+    let mut control = connect(addr).await;
+
+    assert_eq!(greet(&mut control, &[0x00]).await, 0x00);
+    let reply = send_request_ipv4(&mut control, 0x03, [0, 0, 0, 0], 0).await;
+    assert_eq!(reply[1], 0x00);
+    let (bnd_ip, bnd_port) = parse_bnd(&reply);
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay = SocketAddr::new(bnd_ip.into(), bnd_port);
+    client
+        .send_to(&udp_packet(echo, b"actors-udp"), relay)
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 128];
+    let (n, _) = timeout(IO_TIMEOUT, client.recv_from(&mut buf))
+        .await
+        .expect("udp relay timed out")
+        .unwrap();
+    assert_eq!(&buf[10..n], b"actors-udp");
 }
 
 #[actix::test]

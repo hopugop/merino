@@ -26,6 +26,7 @@ proptest! {
         let _ = parse_greeting(&data);
         let _ = parse_userpass(&data);
         let _ = parse_request(&data);
+        let _ = parse_udp_header(&data);
         let _ = pretty_print_addr(&AddrType::V4, &data);
         let _ = pretty_print_addr(&AddrType::V6, &data);
         let _ = pretty_print_addr(&AddrType::Domain, &data);
@@ -41,6 +42,9 @@ proptest! {
             prop_assert!(consumed <= data.len());
         }
         if let Ok((_, consumed)) = parse_request(&data) {
+            prop_assert!(consumed <= data.len());
+        }
+        if let Ok((_, consumed)) = parse_udp_header(&data) {
             prop_assert!(consumed <= data.len());
         }
     }

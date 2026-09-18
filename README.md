@@ -101,8 +101,8 @@ See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap,
 - [ ] Custom plugin/middleware support
 - [ ] `SOCKS5` Commands
   - [x] `CONNECT`
-  - [ ] `BIND`
-  - [ ] `ASSOCIATE`
+  - [x] `BIND`
+  - [x] `ASSOCIATE`
 - [x] Benchmarks & Unit tests
 - [x] [Actix](https://github.com/actix-rs/actix) based backend
 - [ ] `SOCKS4`/`SOCKS4a` Support

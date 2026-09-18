@@ -75,7 +75,9 @@ Pure, fast, no sockets:
 - `parse_greeting` / `parse_userpass` / `parse_request` never panic on arbitrary
   bytes and never claim to consume more than the input length;
 - `AddrType::from` / `SockCommand::from` are total for all `u8`;
-- `SocksReply` is always exactly 10 bytes with `VER = 0x05`;
+- `SocksReply::new` is always exactly 10 bytes with `VER = 0x05`;
+- `parse_udp_header` never panics and never claims to consume more than the
+  input length;
 - `pretty_print_addr` never panics;
 - parsed addresses are always the length implied by their `AddrType`.
 
@@ -86,8 +88,9 @@ Requires a nightly toolchain and `cargo install cargo-fuzz`. Prerequisite
 `&[u8] -> Result<..>` functions so a fuzzer needs no sockets.
 
 Targets: `parse_greeting`, `parse_userpass`, `parse_request`,
-`pretty_print_addr`, and a differential target that feeds identical bytes to the
-Tokio and actix backends over `tokio::io::duplex` and compares replies.
+`parse_udp_header`, `pretty_print_addr`, and a differential target that feeds
+identical bytes to the Tokio and actix backends over `tokio::io::duplex` and
+compares replies.
 
 Run:
 
