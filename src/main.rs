@@ -103,14 +103,16 @@ fn load_users(users_file: &Path, allow_insecure: bool) -> Result<Vec<User>, Box<
     let file = std::fs::File::open(users_file)?;
 
     let metadata = file.metadata()?;
-    // 7 is (S_IROTH | S_IWOTH | S_IXOTH) or the "permisions for others" in unix
-    if (metadata.mode() & 7) > 0 && !allow_insecure {
+    // 0o077 is (S_IRWXG | S_IRWXO) or the group **and** "others" permission
+    // bits in Unix. The users file must not be readable, writable, or
+    // executable by anyone but the owner.
+    if (metadata.mode() & 0o077) > 0 && !allow_insecure {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "Permissions {:o} for {:?} are too open. It is recommended that \
-                your users file is NOT accessible by others. To override this \
-                check, set --allow-insecure",
+                your users file is NOT accessible by group or others. To override \
+                this check, set --allow-insecure",
                 metadata.mode() & 0o777,
                 users_file
             ),
@@ -313,8 +315,29 @@ mod tests {
     }
 
     #[test]
+    fn load_users_rejects_group_readable_file() {
+        let path = write_temp_csv("group", "username,password\nalice,secret\n", 0o640);
+        assert!(load_users(&path, false).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_users_rejects_group_writable_file() {
+        let path = write_temp_csv("group-write", "username,password\nalice,secret\n", 0o620);
+        assert!(load_users(&path, false).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn load_users_allows_world_readable_with_insecure_flag() {
         let path = write_temp_csv("insecure", "username,password\nalice,secret\n", 0o644);
+        assert!(load_users(&path, true).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_users_allows_group_readable_with_insecure_flag() {
+        let path = write_temp_csv("insecure-group", "username,password\nalice,secret\n", 0o640);
         assert!(load_users(&path, true).is_ok());
         let _ = std::fs::remove_file(&path);
     }
