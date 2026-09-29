@@ -1,10 +1,11 @@
 # Merino Hardening & Security Test Plan
 
 This document tracks the work to prove and improve the security posture of the
-SOCKS5 proxy. It complements [`PLAN.md`](PLAN.md) (features) and
-[`ROADMAP.md`](ROADMAP.md) (product direction) by focusing exclusively on
-adversarial input, resource exhaustion, authentication soundness, and
-supply-chain hygiene.
+SOCKS5 proxy. It complements [`PLAN.md`](PLAN.md) (features),
+[`ROADMAP.md`](ROADMAP.md) (product direction), and
+[`PERFORMANCE_ROADMAP.md`](PERFORMANCE_ROADMAP.md) (performance + follow-up
+gaps) by focusing exclusively on adversarial input, resource exhaustion,
+authentication soundness, and supply-chain hygiene.
 
 Each phase is independently committable and verifiable.
 
@@ -14,8 +15,8 @@ Each phase is independently committable and verifiable.
 | ----- | ------ | ----- |
 | A — adversarial integration tests | done | `tests/hardening.rs` |
 | B — property tests | done | `tests/properties.rs` |
-| C — fuzzing | done | `fuzz/` (4 targets, smoke-run clean) |
-| D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml` |
+| C — fuzzing | done | `fuzz/` (5 targets, `forbid(unsafe_code)`, smoke-run clean) |
+| D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml`, `cargo geiger` baseline |
 | E — dynamic/static hardening | mostly | clippy restriction denies + Miri in CI; ASan/TSan pending |
 | F — code coverage | done | `cargo-llvm-cov`, `coverage` job in `.github/workflows/security.yml` |
 | G1–G7 fixes | done | see "Product fixes" below |
@@ -99,14 +100,34 @@ cargo +nightly fuzz run parse_request
 cargo +nightly fuzz run parse_greeting -- -max_total_time=60
 ```
 
+Each target in `fuzz/fuzz_targets/` carries `#![forbid(unsafe_code)]`, so the
+fuzzer bodies are held to the same rule as the crate. This does not cover the
+`libfuzzer-sys` runtime the targets link, which uses `unsafe` internally.
+
 ### Phase D — Supply chain and CI
 
 - `cargo audit` (RUSTSEC advisories) and `cargo deny check` (advisories,
   licenses, bans, sources) as gating jobs.
 - `cargo clippy --all-targets -- -D warnings` for the whole crate.
 - `cargo build --locked` (already used by the Dockerfile); commit `Cargo.lock`.
-- Optional: `cargo geiger` to quantify `unsafe` in dependencies, since the
-  "100% Safe Rust" claim only covers this crate.
+- `cargo geiger` baseline (cargo-geiger 0.13.0, Rust 1.98.1). Run:
+
+  ```bash
+  cargo geiger --all-features --locked
+  ```
+
+  `merino` itself reports `0/0` in every category and is marked `:)`
+  (declares `#![forbid(unsafe_code)]`). The dependency tree is **not**
+  unsafe-free — aggregate `154/286` functions, `11582/16092` expressions,
+  `249/332` impls, `21/22` traits, `459/717` methods — dominated by `tokio`
+  (`109/139` methods), plus `bytes`, `memchr`, `aho-corasick`, `libc`,
+  `parking_lot`, and `syn`. The "100% Safe Rust" claim therefore covers only
+  this crate, not its transitive dependencies.
+
+  Note: geiger exits non-zero (`Found 6 warnings`) on this tree from
+  non-fatal scanner issues — five `.md`/README files it will not scan and a
+  `signal-hook-registry` parse failure against newer syntax. Do not wire it
+  into CI as a hard gate without tolerating those warnings first.
 
 ### Phase E — Dynamic/static hardening (follow-up)
 
@@ -175,6 +196,11 @@ both the property tests and the fuzzers exercise the wire format without
 sockets.
 
 ## Remaining open items
+
+The follow-up items below (sanitizers, indexing lints, per-IP throttling,
+timing hardening) and additional gaps found in a later review pass are tracked
+in [`PERFORMANCE_ROADMAP.md`](PERFORMANCE_ROADMAP.md) with priorities and
+acceptance criteria.
 
 - **Sanitizers.** No ASan/TSan nightly job yet; Miri covers the pure tests but
   not the async/network paths.
