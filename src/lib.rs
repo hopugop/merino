@@ -394,6 +394,27 @@ impl Merino {
     }
 }
 
+/// Whether an I/O error is just the peer going away rather than a proxy fault.
+///
+/// A client that opens a connection and then hangs up (or is reset) part-way
+/// through the SOCKS greeting produces `UnexpectedEof` from `read_exact`, or a
+/// reset/broken-pipe on the reply write. These are routine for a public proxy —
+/// health checks, scanners, clients that give up — so they must not be logged as
+/// server errors.
+fn is_disconnect_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn is_client_disconnect(error: &MerinoError) -> bool {
+    matches!(error, MerinoError::Io(io) if is_disconnect_kind(io.kind()))
+}
+
 /// Drive a single client connection to completion, replying with an error code
 /// and shutting the stream down when the SOCKS negotiation fails.
 pub(crate) async fn run_client<T>(mut client: SOCKClient<T>, client_addr: SocketAddr)
@@ -403,14 +424,30 @@ where
     match client.init().await {
         Ok(_) => {}
         Err(error) => {
-            error!("Error! {:?}, client: {:?}", error, client_addr);
+            let disconnected = is_client_disconnect(&error);
+            if disconnected {
+                debug!(
+                    "Client disconnected during handshake: {}, client: {:?}",
+                    error, client_addr
+                );
+            } else {
+                error!("Error! {:?}, client: {:?}", error, client_addr);
+            }
 
             if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await {
-                warn!("Failed to send error code: {:?}", e);
+                if is_disconnect_kind(e.kind()) {
+                    debug!("Client already gone, reply not sent: {:?}", e);
+                } else {
+                    warn!("Failed to send error code: {:?}", e);
+                }
             }
 
             if let Err(e) = client.shutdown().await {
-                warn!("Failed to shutdown TcpStream: {:?}", e);
+                if is_disconnect_kind(e.kind()) {
+                    debug!("Client already gone, shutdown skipped: {:?}", e);
+                } else {
+                    warn!("Failed to shutdown TcpStream: {:?}", e);
+                }
             };
         }
     }
@@ -1459,6 +1496,31 @@ mod tests {
 
         let io: ResponseCode = MerinoError::Io(io::Error::other("boom")).into();
         assert_eq!(io as u8, ResponseCode::Failure as u8);
+    }
+
+    #[test]
+    fn client_disconnects_are_classified() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_disconnect_kind(kind));
+            assert!(is_client_disconnect(&MerinoError::Io(io::Error::new(
+                kind, "gone"
+            ))));
+        }
+
+        // Genuine proxy faults and unrelated I/O errors must still be reported.
+        assert!(!is_client_disconnect(&MerinoError::Socks(
+            ResponseCode::HostUnreachable
+        )));
+        assert!(!is_client_disconnect(&MerinoError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "nope"
+        ))));
+        assert!(!is_disconnect_kind(io::ErrorKind::PermissionDenied));
     }
 
     #[test]
