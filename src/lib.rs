@@ -1740,7 +1740,10 @@ mod tests {
         assert_eq!(reply.as_bytes()[0], 0x05);
         assert_eq!(reply.as_bytes()[1], 0x00);
         assert_eq!(reply.as_bytes()[3], 0x04);
-        assert_eq!(&reply.as_bytes()[4..20], &[0x20, 0x01, 0x0d, 0xb8, 0,0,0,0,0,0,0,0,0,0,0,1]);
+        assert_eq!(
+            &reply.as_bytes()[4..20],
+            &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
         assert_eq!(&reply.as_bytes()[20..22], &443u16.to_be_bytes());
     }
 
