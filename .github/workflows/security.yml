@@ -101,5 +101,7 @@ jobs:
         run: cargo +nightly fuzz run parse_userpass -- -max_total_time=60 -rss_limit_mb=2048
       - name: Fuzz parse_request
         run: cargo +nightly fuzz run parse_request -- -max_total_time=60 -rss_limit_mb=2048
+      - name: Fuzz parse_udp_header
+        run: cargo +nightly fuzz run parse_udp_header -- -max_total_time=60 -rss_limit_mb=2048
       - name: Fuzz pretty_print_addr
         run: cargo +nightly fuzz run pretty_print_addr -- -max_total_time=60 -rss_limit_mb=2048

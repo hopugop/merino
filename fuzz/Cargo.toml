@@ -35,6 +35,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "parse_udp_header"
+path = "fuzz_targets/parse_udp_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pretty_print_addr"
 path = "fuzz_targets/pretty_print_addr.rs"
 test = false
