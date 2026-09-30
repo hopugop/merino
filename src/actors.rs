@@ -8,7 +8,7 @@ use actix::prelude::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{DEFAULT_MAX_CONNECTIONS, SOCKClient, User, bind_all, run_client};
+use crate::{DEFAULT_MAX_CONNECTIONS, SOCKClient, User, accept_loop, bind_all, run_client};
 
 /// One actor per accepted TCP connection.
 ///
@@ -127,34 +127,20 @@ impl Actor for SocksServer {
             let users = users.clone();
             let auth_methods = auth_methods.clone();
             let semaphore = semaphore.clone();
-            ctx.spawn(fut::wrap_future::<_, SocksServer>(async move {
-                loop {
-                    // Acquire a slot before accepting so excess connections
-                    // wait in the kernel backlog instead of spawning actors.
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
-                    };
-                    match listener.accept().await {
-                        Ok((stream, peer)) => {
-                            let local_addr = stream.local_addr().ok();
-                            let mut client = SOCKClient::new(
-                                stream,
-                                users.clone(),
-                                auth_methods.clone(),
-                                timeout,
-                            );
-                            client.set_local_addr(local_addr);
-                            SocksConnection::create(move |_| {
-                                let mut connection = SocksConnection::new(client, peer);
-                                connection.set_permit(permit);
-                                connection
-                            });
-                        }
-                        Err(e) => warn!("Accept error: {:?}", e),
-                    }
-                }
-            }));
+            ctx.spawn(fut::wrap_future::<_, SocksServer>(accept_loop(
+                listener,
+                semaphore,
+                users,
+                auth_methods,
+                timeout,
+                |client, peer, permit| {
+                    SocksConnection::create(move |_| {
+                        let mut connection = SocksConnection::new(client, peer);
+                        connection.set_permit(permit);
+                        connection
+                    });
+                },
+            )));
         }
     }
 }

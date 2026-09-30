@@ -17,7 +17,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 /// Version of socks
@@ -378,36 +378,65 @@ impl Merino {
             let auth_methods = self.auth_methods.clone();
             let timeout = self.timeout;
             let semaphore = semaphore.clone();
-            set.spawn(async move {
-                loop {
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
-                    };
-                    match listener.accept().await {
-                        Ok((stream, client_addr)) => {
-                            let local_addr = stream.local_addr().ok();
-                            let mut client = SOCKClient::new(
-                                stream,
-                                users.clone(),
-                                auth_methods.clone(),
-                                timeout,
-                            );
-                            client.set_local_addr(local_addr);
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                run_client(client, client_addr).await;
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Accept error: {:?}", e);
-                            drop(permit);
-                        }
-                    }
-                }
-            });
+            set.spawn(accept_loop(
+                listener,
+                semaphore,
+                users,
+                auth_methods,
+                timeout,
+                |client, client_addr, permit| {
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        run_client(client, client_addr).await;
+                    });
+                },
+            ));
         }
         while set.join_next().await.is_some() {}
+    }
+}
+
+/// Accept loop shared by both backends.
+///
+/// One slot of `semaphore` is acquired *before* each `accept`, so excess
+/// connections wait in the kernel backlog instead of spawning unbounded
+/// tasks/actors. The accepted client (with its local address recorded) and the
+/// permit are handed to `on_accept`, which owns the permit for the lifetime of
+/// the connection and decides how to run it — a Tokio task for [`Merino`], an
+/// actor for [`SocksServer`].
+///
+/// A failed `accept` releases the slot and keeps serving; the two backends had
+/// drifted on exactly this point before the loop was shared.
+pub(crate) async fn accept_loop<F>(
+    listener: TcpListener,
+    semaphore: Arc<Semaphore>,
+    users: Arc<Vec<User>>,
+    auth_methods: Arc<Vec<u8>>,
+    timeout: Option<Duration>,
+    mut on_accept: F,
+) where
+    F: FnMut(SOCKClient<TcpStream>, SocketAddr, OwnedSemaphorePermit) + Send + 'static,
+{
+    loop {
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // The semaphore is never closed; treat it as a stop signal anyway.
+            Err(_) => break,
+        };
+
+        match listener.accept().await {
+            Ok((stream, client_addr)) => {
+                let local_addr = stream.local_addr().ok();
+                let mut client =
+                    SOCKClient::new(stream, users.clone(), auth_methods.clone(), timeout);
+                client.set_local_addr(local_addr);
+                on_accept(client, client_addr, permit);
+            }
+            Err(e) => {
+                warn!("Accept error: {:?}", e);
+                drop(permit);
+            }
+        }
     }
 }
 
