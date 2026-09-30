@@ -83,6 +83,29 @@ jobs:
       - name: Miri
         run: cargo +nightly miri test --lib -- --skip addr_to_socket
 
+  sanitizers:
+    name: ASan / TSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # TSan needs an instrumented std, which -Zbuild-std builds from source.
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test --locked --target x86_64-unknown-linux-gnu
+      # TSan changes core's ABI, so plain RUSTFLAGS would trip the
+      # "mixing -Zsanitizer" check on every dependency; the per-target variable
+      # plus -Zbuild-std instruments std instead. Doctests are skipped because
+      # their separate compilation mixes sanitized and host units.
+      - name: ThreadSanitizer
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zsanitizer=thread
+        run: cargo +nightly test --locked --tests -Zbuild-std --target x86_64-unknown-linux-gnu
+
   fuzz:
     name: Fuzz smoke test
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
