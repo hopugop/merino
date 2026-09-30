@@ -2,6 +2,7 @@ mod support;
 
 use actix::Actor;
 use merino::*;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use support::*;
@@ -334,4 +335,100 @@ async fn merino_connection_cap_throttles_excess_clients() {
         .expect("queued client should be served once a slot frees")
         .unwrap();
     assert_eq!(buf, [0x05, 0x00]);
+}
+
+/// Non-panicking probe: is a fresh connection from this client currently
+/// served (greeting answered), or dropped by the per-IP cap?
+async fn per_ip_probe_served(addr: SocketAddr) -> bool {
+    let Ok(Ok(mut stream)) = timeout(IO_TIMEOUT, tokio::net::TcpStream::connect(addr)).await else {
+        return false;
+    };
+    if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+        return false;
+    }
+    let mut resp = [0u8; 2];
+    matches!(
+        timeout(Duration::from_millis(300), stream.read_exact(&mut resp)).await,
+        Ok(Ok(_))
+    ) && resp == [0x05, 0x00]
+}
+
+/// Wait until `per_ip_probe_served` reports the slot is free again.
+async fn await_slot_freed(addr: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    while !per_ip_probe_served(addr).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "per-IP slot was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn merino_per_ip_cap_drops_excess_from_one_source() {
+    let mut merino = Merino::new(
+        0,
+        "127.0.0.1",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind Merino");
+    merino.set_max_connections_per_ip(1);
+    let addr = merino.local_addr().expect("failed to read local addr");
+    tokio::spawn(async move {
+        merino.serve().await;
+    });
+
+    // The first connection holds this source's only slot while it negotiates.
+    let mut first = connect(addr).await;
+
+    // A second connection from the same source is closed, not queued.
+    let mut second = connect(addr).await;
+    let mut buf = [0u8; 1];
+    let n = timeout(IO_TIMEOUT, second.read(&mut buf))
+        .await
+        .expect("expected the excess connection to be closed")
+        .unwrap();
+    assert_eq!(n, 0, "excess per-IP connection should be closed");
+
+    // The first one is unaffected and completes its handshake...
+    assert_eq!(greet(&mut first, &[0x00]).await, 0x00);
+    drop(first);
+
+    // ...and once it ends, the source may connect again.
+    await_slot_freed(addr).await;
+}
+
+#[actix::test]
+async fn actors_per_ip_cap_drops_excess_from_one_source() {
+    let mut server = SocksServer::bind(
+        0,
+        "127.0.0.1",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind SocksServer");
+    server.set_max_connections_per_ip(1);
+    let addr = server.local_addr().expect("failed to read local addr");
+    server.start();
+
+    let mut first = connect(addr).await;
+
+    let mut second = connect(addr).await;
+    let mut buf = [0u8; 1];
+    let n = timeout(IO_TIMEOUT, second.read(&mut buf))
+        .await
+        .expect("expected the excess connection to be closed")
+        .unwrap();
+    assert_eq!(n, 0, "excess per-IP connection should be closed");
+
+    assert_eq!(greet(&mut first, &[0x00]).await, 0x00);
+    drop(first);
+
+    await_slot_freed(addr).await;
 }

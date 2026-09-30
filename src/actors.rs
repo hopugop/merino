@@ -9,7 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    DEFAULT_MAX_CONNECTIONS, DnsCache, SOCKClient, User, accept_loop, bind_all, run_client,
+    DEFAULT_MAX_CONNECTIONS, DnsCache, IpSlot, PerIpLimiter, SOCKClient, ServerContext, User,
+    accept_loop, bind_all, run_client,
 };
 
 /// One actor per accepted TCP connection.
@@ -22,6 +23,9 @@ pub struct SocksConnection {
     /// Held for the lifetime of the connection so the server's connection
     /// semaphore releases the slot when the actor stops.
     _permit: Option<OwnedSemaphorePermit>,
+    /// Held for the same reason, so the source IP's per-IP slot is freed when
+    /// the actor stops.
+    _ip_slot: Option<IpSlot>,
 }
 
 impl SocksConnection {
@@ -30,12 +34,18 @@ impl SocksConnection {
             client: Some(client),
             peer,
             _permit: None,
+            _ip_slot: None,
         }
     }
 
     /// Attach the connection-cap permit acquired by the server.
     pub fn set_permit(&mut self, permit: OwnedSemaphorePermit) {
         self._permit = Some(permit);
+    }
+
+    /// Attach the per-IP slot acquired by the server.
+    pub(crate) fn set_ip_slot(&mut self, slot: Option<IpSlot>) {
+        self._ip_slot = slot;
     }
 }
 
@@ -72,6 +82,8 @@ pub struct SocksServer {
     max_connections: usize,
     /// Optional positive DNS cache for `Domain` destinations; off by default.
     dns_cache: Option<Arc<DnsCache>>,
+    /// Optional per-source connection cap; off by default.
+    per_ip: Option<Arc<PerIpLimiter>>,
 }
 
 impl SocksServer {
@@ -97,6 +109,7 @@ impl SocksServer {
             timeout,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             dns_cache: None,
+            per_ip: None,
         })
     }
 
@@ -117,6 +130,15 @@ impl SocksServer {
         self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
     }
 
+    /// Cap how many simultaneous connections a single source IP may hold.
+    ///
+    /// Zero disables the cap (the default). See
+    /// [`Merino::set_max_connections_per_ip`](crate::Merino::set_max_connections_per_ip).
+    /// Call before [`Actor::start`].
+    pub fn set_max_connections_per_ip(&mut self, max: usize) {
+        self.per_ip = (max > 0).then(|| Arc::new(PerIpLimiter::new(max)));
+    }
+
     /// Address of the first listener, or `None` if none is bound.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.bound_addrs.first().copied()
@@ -132,28 +154,27 @@ impl Actor for SocksServer {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let users = self.users.clone();
-        let auth_methods = self.auth_methods.clone();
-        let timeout = self.timeout;
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
-        let dns_cache = self.dns_cache.clone();
+        let server_ctx = ServerContext {
+            users: self.users.clone(),
+            auth_methods: self.auth_methods.clone(),
+            timeout: self.timeout,
+            dns_cache: self.dns_cache.clone(),
+            per_ip: self.per_ip.clone(),
+        };
 
         for listener in std::mem::take(&mut self.listeners) {
-            let users = users.clone();
-            let auth_methods = auth_methods.clone();
             let semaphore = semaphore.clone();
-            let dns_cache = dns_cache.clone();
+            let server_ctx = server_ctx.clone();
             ctx.spawn(fut::wrap_future::<_, SocksServer>(accept_loop(
                 listener,
                 semaphore,
-                users,
-                auth_methods,
-                timeout,
-                dns_cache,
-                |client, peer, permit| {
+                server_ctx,
+                |client, peer, permit, ip_slot| {
                     SocksConnection::create(move |_| {
                         let mut connection = SocksConnection::new(client, peer);
                         connection.set_permit(permit);
+                        connection.set_ip_slot(ip_slot);
                         connection
                     });
                 },

@@ -335,6 +335,8 @@ pub struct Merino {
     max_connections: usize,
     /// Optional positive DNS cache for `Domain` destinations; off by default.
     dns_cache: Option<Arc<DnsCache>>,
+    /// Optional per-source connection cap; off by default.
+    per_ip: Option<Arc<PerIpLimiter>>,
 }
 
 impl Merino {
@@ -353,6 +355,7 @@ impl Merino {
             timeout,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             dns_cache: None,
+            per_ip: None,
         })
     }
 
@@ -373,6 +376,16 @@ impl Merino {
         self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
     }
 
+    /// Cap how many simultaneous connections a single source IP may hold.
+    ///
+    /// Zero disables the cap (the default). Without it one host can occupy
+    /// every slot of [`set_max_connections`](Self::set_max_connections) and
+    /// starve the rest. Excess connections are closed immediately rather than
+    /// queued, so a throttled client cannot pin the process' backlog.
+    pub fn set_max_connections_per_ip(&mut self, max: usize) {
+        self.per_ip = (max > 0).then(|| Arc::new(PerIpLimiter::new(max)));
+    }
+
     /// Return the first address a listener is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listeners
@@ -391,22 +404,24 @@ impl Merino {
         let listeners = std::mem::take(&mut self.listeners);
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
         let mut set = tokio::task::JoinSet::new();
+        let ctx = ServerContext {
+            users: self.users.clone(),
+            auth_methods: self.auth_methods.clone(),
+            timeout: self.timeout,
+            dns_cache: self.dns_cache.clone(),
+            per_ip: self.per_ip.clone(),
+        };
         for listener in listeners {
-            let users = self.users.clone();
-            let auth_methods = self.auth_methods.clone();
-            let timeout = self.timeout;
             let semaphore = semaphore.clone();
-            let dns_cache = self.dns_cache.clone();
+            let ctx = ctx.clone();
             set.spawn(accept_loop(
                 listener,
                 semaphore,
-                users,
-                auth_methods,
-                timeout,
-                dns_cache,
-                |client, client_addr, permit| {
+                ctx,
+                |client, client_addr, permit, ip_slot| {
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _ip_slot = ip_slot;
                         run_client(client, client_addr).await;
                     });
                 },
@@ -414,6 +429,86 @@ impl Merino {
         }
         while set.join_next().await.is_some() {}
     }
+}
+
+/// Per-source cap on simultaneous connections.
+///
+/// The global connection cap protects the process as a whole, but one source
+/// can still occupy every slot and starve everyone else. This bounds how many
+/// connections a single IP address holds at once. Off unless configured with
+/// [`Merino::set_max_connections_per_ip`] /
+/// [`SocksServer::set_max_connections_per_ip`].
+///
+/// This is resource control at accept time, not policy: address/command
+/// allow-lists and request rewriting remain the (unimplemented) middleware
+/// work, which can layer on top.
+struct PerIpLimiter {
+    limit: usize,
+    counts: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// A held per-IP slot. Dropping it (when the connection ends) frees the slot.
+struct IpSlot {
+    ip: IpAddr,
+    limiter: Arc<PerIpLimiter>,
+}
+
+impl PerIpLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reserve a slot for `ip`, or `None` when it already holds `limit`.
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpSlot> {
+        let mut counts = lock_counts(&self.counts);
+        let held = counts.entry(ip).or_insert(0);
+        if *held >= self.limit {
+            return None;
+        }
+        *held += 1;
+        Some(IpSlot {
+            ip,
+            limiter: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut counts = lock_counts(&self.limiter.counts);
+        if let Some(held) = counts.get_mut(&self.ip) {
+            *held -= 1;
+            if *held == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Lock a counter map, recovering from a poisoned lock.
+///
+/// A panic elsewhere only means some thread died mid-update; the counts stay
+/// usable, and refusing every later connection over it would be worse.
+fn lock_counts(
+    counts: &Mutex<HashMap<IpAddr, usize>>,
+) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+    match counts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Everything the accept loop needs that every connection shares.
+#[derive(Clone)]
+pub(crate) struct ServerContext {
+    users: Arc<Vec<User>>,
+    auth_methods: Arc<Vec<u8>>,
+    timeout: Option<Duration>,
+    dns_cache: Option<Arc<DnsCache>>,
+    per_ip: Option<Arc<PerIpLimiter>>,
 }
 
 /// Accept loop shared by both backends.
@@ -430,17 +525,16 @@ impl Merino {
 pub(crate) async fn accept_loop<F>(
     listener: TcpListener,
     semaphore: Arc<Semaphore>,
-    users: Arc<Vec<User>>,
-    auth_methods: Arc<Vec<u8>>,
-    timeout: Option<Duration>,
-    dns_cache: Option<Arc<DnsCache>>,
+    ctx: ServerContext,
     mut on_accept: F,
 ) where
-    F: FnMut(SOCKClient<TcpStream>, SocketAddr, OwnedSemaphorePermit) + Send + 'static,
+    F: FnMut(SOCKClient<TcpStream>, SocketAddr, OwnedSemaphorePermit, Option<IpSlot>)
+        + Send
+        + 'static,
 {
     // One scan for the whole server: the comparison width only changes when the
     // credential list does.
-    let credential_width = credential_width(&users);
+    let credential_width = credential_width(&ctx.users);
 
     loop {
         let permit = match semaphore.clone().acquire_owned().await {
@@ -451,19 +545,38 @@ pub(crate) async fn accept_loop<F>(
 
         match listener.accept().await {
             Ok((stream, client_addr)) => {
+                // Refuse a source that is already at its per-IP limit before
+                // building a client for it. The global permit is released so
+                // the slot it briefly held is not wasted.
+                let ip_slot = match &ctx.per_ip {
+                    Some(limiter) => match limiter.try_acquire(client_addr.ip()) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            debug!(
+                                "Per-IP connection limit reached for {}, closing",
+                                client_addr.ip()
+                            );
+                            drop(permit);
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+
                 let local_addr = stream.local_addr().ok();
                 let mut client = SOCKClient::with_credential_width(
                     stream,
-                    users.clone(),
-                    auth_methods.clone(),
-                    timeout,
+                    ctx.users.clone(),
+                    ctx.auth_methods.clone(),
+                    ctx.timeout,
                     credential_width,
                 );
                 client.set_local_addr(local_addr);
-                if let Some(cache) = &dns_cache {
+                if let Some(cache) = &ctx.dns_cache {
                     client.set_dns_cache(Arc::clone(cache));
                 }
-                on_accept(client, client_addr, permit);
+                on_accept(client, client_addr, permit, ip_slot);
             }
             Err(e) => {
                 warn!("Accept error: {:?}", e);
@@ -2057,6 +2170,28 @@ mod tests {
             credential_width(&[User::new("alice", "secret"), User::new("bob", "hunter2!")]),
             "hunter2!".len()
         );
+    }
+
+    #[test]
+    fn per_ip_limiter_bounds_each_source_and_releases_on_drop() {
+        let limiter = Arc::new(PerIpLimiter::new(1));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let other: IpAddr = "127.0.0.2".parse().unwrap();
+
+        let held = limiter.try_acquire(ip).expect("first slot");
+        assert!(
+            limiter.try_acquire(ip).is_none(),
+            "a source at its limit must be refused"
+        );
+        // Other sources are not affected by one being at its limit.
+        let other_held = limiter.try_acquire(other).expect("other source allowed");
+
+        drop(held);
+        assert!(
+            limiter.try_acquire(ip).is_some(),
+            "dropping the slot frees it"
+        );
+        drop(other_held);
     }
 
     #[test]

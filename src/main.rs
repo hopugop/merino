@@ -70,6 +70,11 @@ struct Opt {
     #[arg(long, value_name = "SECONDS", default_value_t = 0)]
     dns_cache_ttl: u64,
 
+    /// Cap simultaneous connections from one source IP. 0 (the default)
+    /// leaves one host able to occupy every --max-connections slot.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max_connections_per_ip: usize,
+
     /// Maximum number of names held in the DNS cache
     #[arg(long, value_name = "ENTRIES", default_value_t = merino::DEFAULT_DNS_CACHE_ENTRIES)]
     dns_cache_entries: usize,
@@ -212,6 +217,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None,
     ))?;
     server.set_max_connections(opt.max_connections);
+    server.set_max_connections_per_ip(opt.max_connections_per_ip);
     if opt.dns_cache_ttl > 0 {
         server.set_dns_cache(
             Duration::from_secs(opt.dns_cache_ttl),
