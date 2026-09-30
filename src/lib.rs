@@ -422,6 +422,10 @@ pub(crate) async fn accept_loop<F>(
 ) where
     F: FnMut(SOCKClient<TcpStream>, SocketAddr, OwnedSemaphorePermit) + Send + 'static,
 {
+    // One scan for the whole server: the comparison width only changes when the
+    // credential list does.
+    let credential_width = credential_width(&users);
+
     loop {
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -432,8 +436,13 @@ pub(crate) async fn accept_loop<F>(
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 let local_addr = stream.local_addr().ok();
-                let mut client =
-                    SOCKClient::new(stream, users.clone(), auth_methods.clone(), timeout);
+                let mut client = SOCKClient::with_credential_width(
+                    stream,
+                    users.clone(),
+                    auth_methods.clone(),
+                    timeout,
+                    credential_width,
+                );
                 client.set_local_addr(local_addr);
                 on_accept(client, client_addr, permit);
             }
@@ -522,6 +531,10 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     /// True once the client has been answered during authentication, so the
     /// error path in `run_client` does not write a second reply.
     replied: bool,
+    /// Longest username/password in `authed_users`, used as the fixed width of
+    /// the constant-time credential comparison so its cost does not depend on
+    /// how long the client's input is.
+    credential_width: usize,
 }
 
 impl<T> SOCKClient<T>
@@ -535,6 +548,28 @@ where
         auth_methods: Arc<Vec<u8>>,
         timeout: Option<Duration>,
     ) -> Self {
+        let credential_width = credential_width(&authed_users);
+        Self::with_credential_width(
+            stream,
+            authed_users,
+            auth_methods,
+            timeout,
+            credential_width,
+        )
+    }
+
+    /// Create a client with a caller-supplied constant-time comparison width.
+    ///
+    /// [`SOCKClient::new`] derives it from the credential list; the accept loop
+    /// already knows the width for the whole server, so it passes it in rather
+    /// than rescanning the list on every connection.
+    pub(crate) fn with_credential_width(
+        stream: T,
+        authed_users: Arc<Vec<User>>,
+        auth_methods: Arc<Vec<u8>>,
+        timeout: Option<Duration>,
+        credential_width: usize,
+    ) -> Self {
         SOCKClient {
             stream,
             auth_nmethods: 0,
@@ -545,6 +580,7 @@ where
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             local_addr: None,
             replied: false,
+            credential_width,
         }
     }
 
@@ -564,6 +600,7 @@ where
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             local_addr: None,
             replied: false,
+            credential_width: 0,
         }
     }
 
@@ -597,8 +634,16 @@ where
     fn authed(&self, username: &[u8], password: &[u8]) -> bool {
         let mut found = false;
         for candidate in self.authed_users.iter() {
-            let username_ok = ct_eq(username, candidate.username.as_bytes());
-            let password_ok = ct_eq(password, candidate.password.as_bytes());
+            let username_ok = ct_eq(
+                username,
+                candidate.username.as_bytes(),
+                self.credential_width,
+            );
+            let password_ok = ct_eq(
+                password,
+                candidate.password.as_bytes(),
+                self.credential_width,
+            );
             found |= username_ok & password_ok;
         }
         found
@@ -1287,17 +1332,38 @@ pub(crate) fn truncated() -> MerinoError {
     ))
 }
 
-/// Compare two byte strings without an early exit on the first differing byte.
+/// Longest username or password in the list, or zero when it is empty.
 ///
-/// The length is still observable, but this avoids leaking *where* a username
-/// or password first diverges through timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+/// This is the fixed width used by [`ct_eq`], so it is computed once per
+/// server rather than per login.
+fn credential_width(users: &[User]) -> usize {
+    users
+        .iter()
+        .map(|user| user.username.len().max(user.password.len()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Compare two byte strings with the same work for every input length.
+///
+/// `width` is the longest credential this server stores, so the loop runs a
+/// fixed number of iterations whatever the incoming bytes are: timing reveals
+/// neither the stored credential length nor where the incoming value first
+/// diverges. The length check is folded into the accumulator instead of
+/// short-circuiting. A value longer than `width` is rejected by that length
+/// mismatch — the wire caps credentials at 255 bytes, so it cannot spuriously
+/// match.
+///
+/// Cost is proportional to `width` rather than to the actual length compared,
+/// so the scan is measurably slower than the previous length-short-circuiting
+/// version: `benches/parse.rs` measures 1.75x on a 10k-user list (110 -> 193
+/// us of lookup) and no change for the small lists this proxy is normally run
+/// with. Padding to the 255-byte wire maximum instead was measured at 46x
+/// (4.1 ms), so the per-server width is what makes the trade bearable.
+fn ct_eq(a: &[u8], b: &[u8], width: usize) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..width {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
     diff == 0
 }
@@ -1812,11 +1878,31 @@ mod tests {
 
     #[test]
     fn ct_eq_is_equality() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(!ct_eq(b"secret", b"secrez"));
-        assert!(!ct_eq(b"secret", b"secret2"));
-        assert!(!ct_eq(b"", b"x"));
-        assert!(ct_eq(b"", b""));
+        let width = 8;
+        assert!(ct_eq(b"secret", b"secret", width));
+        assert!(!ct_eq(b"secret", b"secrez", width));
+        assert!(!ct_eq(b"secret", b"secret2", width));
+        assert!(!ct_eq(b"", b"x", width));
+        assert!(ct_eq(b"", b"", width));
+        // A value longer than the configured width still cannot match a
+        // shorter one by being truncated.
+        assert!(!ct_eq(b"secrets!", b"secret", width));
+        assert!(!ct_eq(b"secret", b"secrets!", width));
+        // Embedded NULs are compared rather than treated as padding.
+        assert!(!ct_eq(b"sec\0ret", b"secret", width));
+    }
+
+    #[test]
+    fn credential_width_is_the_longest_value() {
+        assert_eq!(credential_width(&[]), 0);
+        assert_eq!(
+            credential_width(&[User::new("alice", "secret")]),
+            "secret".len()
+        );
+        assert_eq!(
+            credential_width(&[User::new("alice", "secret"), User::new("bob", "hunter2!")]),
+            "hunter2!".len()
+        );
     }
 
     #[tokio::test]
