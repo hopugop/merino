@@ -776,7 +776,17 @@ where
             SockCommand::Connect => {
                 debug!("Handling CONNECT Command");
 
-                let sock_addr = addr_to_socket(&req.addr_type, &req.addr, req.port).await?;
+                // A name that does not resolve is a property of the requested
+                // destination, not a server failure, so it gets its own code.
+                // `InvalidInput` is the other arm of `addr_to_socket`: a
+                // malformed address, which is a bad request rather than an
+                // unreachable host.
+                let sock_addr = addr_to_socket(&req.addr_type, &req.addr, req.port)
+                    .await
+                    .map_err(|e| match e.kind() {
+                        io::ErrorKind::InvalidInput => MerinoError::Io(e),
+                        _ => dns_failure_error(),
+                    })?;
 
                 trace!("Connecting to: {:?}", sock_addr);
 
@@ -789,12 +799,7 @@ where
                     )
                     .await
                     .map_err(|_| connect_timeout_error())?
-                    .map_err(|e| match e.kind() {
-                        io::ErrorKind::ConnectionRefused => {
-                            MerinoError::Socks(ResponseCode::ConnectionRefused)
-                        }
-                        _ => MerinoError::Io(e),
-                    })?;
+                    .map_err(connect_error)?;
 
                 trace!("Connected!");
 
@@ -1004,6 +1009,32 @@ where
 /// one that is actively rejecting the connection.
 fn connect_timeout_error() -> MerinoError {
     MerinoError::Socks(ResponseCode::TtlExpired)
+}
+
+/// Error reported when the destination name cannot be resolved.
+///
+/// A name that does not resolve is `host unreachable` (RFC 1928 §6), which
+/// lets a client tell it apart from a generic server failure.
+fn dns_failure_error() -> MerinoError {
+    MerinoError::Socks(ResponseCode::HostUnreachable)
+}
+
+/// Map a failed outbound connect to the closest reply code of RFC 1928 §6.
+///
+/// Only refusal was distinguished before, so every network error a client
+/// could act on — unroutable network, unreachable host, bad local address —
+/// came back as the generic `Failure` (`0x01`).
+fn connect_error(error: io::Error) -> MerinoError {
+    match error.kind() {
+        io::ErrorKind::ConnectionRefused => MerinoError::Socks(ResponseCode::ConnectionRefused),
+        io::ErrorKind::NetworkUnreachable | io::ErrorKind::NetworkDown => {
+            MerinoError::Socks(ResponseCode::NetworkUnreachable)
+        }
+        io::ErrorKind::HostUnreachable | io::ErrorKind::AddrNotAvailable => {
+            MerinoError::Socks(ResponseCode::HostUnreachable)
+        }
+        _ => MerinoError::Io(error),
+    }
 }
 
 /// Convert an address and AddrType to a SocketAddr
@@ -1766,6 +1797,49 @@ mod tests {
     fn pretty_print_short_addresses_do_not_panic() {
         assert!(pretty_print_addr(&AddrType::V4, &[1, 2]).contains("invalid"));
         assert!(pretty_print_addr(&AddrType::V6, &[1, 2, 3]).contains("invalid"));
+    }
+
+    #[test]
+    fn connect_error_maps_network_failures_to_reply_codes() {
+        let code_of = |kind: io::ErrorKind| match connect_error(io::Error::from(kind)) {
+            MerinoError::Socks(code) => code,
+            other => panic!("expected a SOCKS reply code, got {other:?}"),
+        };
+
+        assert!(matches!(
+            code_of(io::ErrorKind::ConnectionRefused),
+            ResponseCode::ConnectionRefused
+        ));
+        assert!(matches!(
+            code_of(io::ErrorKind::NetworkUnreachable),
+            ResponseCode::NetworkUnreachable
+        ));
+        assert!(matches!(
+            code_of(io::ErrorKind::NetworkDown),
+            ResponseCode::NetworkUnreachable
+        ));
+        assert!(matches!(
+            code_of(io::ErrorKind::HostUnreachable),
+            ResponseCode::HostUnreachable
+        ));
+        assert!(matches!(
+            code_of(io::ErrorKind::AddrNotAvailable),
+            ResponseCode::HostUnreachable
+        ));
+
+        // Anything the client cannot act on stays a generic failure.
+        assert!(matches!(
+            connect_error(io::Error::from(io::ErrorKind::PermissionDenied)),
+            MerinoError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn dns_failure_is_host_unreachable() {
+        assert!(matches!(
+            dns_failure_error(),
+            MerinoError::Socks(ResponseCode::HostUnreachable)
+        ));
     }
 
     #[test]

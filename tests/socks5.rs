@@ -121,6 +121,22 @@ async fn connect_by_domain_name_succeeds() {
 }
 
 #[tokio::test]
+async fn connect_to_unresolvable_domain_is_host_unreachable() {
+    let server = start_no_auth().await;
+    let mut stream = connect(server.addr).await;
+
+    assert_eq!(greet(&mut stream, &[0x00]).await, 0x00);
+
+    // `.invalid` is reserved by RFC 2606 and never resolves, so this is a
+    // destination the client asked for, not a server failure: RFC 1928 §6
+    // distinguishes it as host unreachable (0x04).
+    assert_eq!(
+        request_domain(&mut stream, 0x01, "unresolvable.invalid", 80).await,
+        0x04
+    );
+}
+
+#[tokio::test]
 async fn connect_to_dead_port_is_refused() {
     let dead = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

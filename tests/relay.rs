@@ -83,13 +83,14 @@ async fn connect_to_blackholed_destination_fails_within_budget() {
 }
 
 #[tokio::test]
-async fn connect_io_error_maps_to_failure() {
+async fn connect_to_unroutable_address_is_network_unreachable() {
     let (mut peer, mut client) = duplex_client(vec![AuthMethods::NoAuth as u8], Vec::new(), None);
     let task = tokio::spawn(async move { client.init().await });
 
     start_noauth(&mut peer).await;
-    // The limited broadcast address is rejected without SO_BROADCAST, which is
-    // an I/O error rather than a refusal.
+    // The limited broadcast address is rejected without SO_BROADCAST. Linux
+    // reports that as NetworkUnreachable, which RFC 1928 §6 gives its own
+    // reply code rather than the generic server failure.
     peer.write_all(&ipv4_request(0x01, [255, 255, 255, 255], 1))
         .await
         .unwrap();
@@ -100,10 +101,11 @@ async fn connect_io_error_maps_to_failure() {
         .expect("task panicked")
         .expect_err("broadcast connect should fail");
     match err {
-        MerinoError::Io(e) => {
-            assert_eq!(e.kind(), std::io::ErrorKind::NetworkUnreachable);
-        }
-        other => panic!("expected an I/O error, got {other:?}"),
+        MerinoError::Socks(code) => assert!(
+            matches!(code, ResponseCode::NetworkUnreachable),
+            "expected network unreachable (0x03), got {code:?}"
+        ),
+        other => panic!("expected a SOCKS reply code, got {other:?}"),
     }
 }
 
