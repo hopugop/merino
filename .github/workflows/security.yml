@@ -41,7 +41,7 @@ jobs:
           key: coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage report
-        run: cargo llvm-cov --locked --all-targets --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --all-targets --fail-under-lines 95 --lcov --output-path lcov.info
       - name: Render HTML report
         run: cargo llvm-cov report --html
       - name: Upload coverage artifact
