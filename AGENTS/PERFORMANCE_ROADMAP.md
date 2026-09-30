@@ -18,10 +18,10 @@ linked, not duplicated.
 | ---- | ------ | ------ | ----- |
 | P1 — users-file permission check (group bits) | security | done | `src/main.rs` |
 | P2 — wire `parse_udp_header` fuzz target into CI | security | done | `fuzz/`, `.github/workflows/security.yml` |
-| P3 — sanitize client bytes in logs | security | open | `src/lib.rs` |
-| P4 — bound `handle_client` with the handshake timeout | security | open | `src/lib.rs` |
+| P3 — sanitize client bytes in logs | security | done | `src/lib.rs` (`sanitize_domain`) |
+| P4 — bound `handle_client` with the handshake timeout | security | done | `src/lib.rs` (`SOCKClient::handle_client`) |
 | P5 — RFC-correct reply codes for DNS/network errors | security | open | `src/lib.rs` |
-| P6 — short-circuit failed USERPASS auth | security | open | `src/lib.rs` |
+| P6 — short-circuit failed USERPASS auth | security | done | `src/lib.rs` (`SOCKClient::auth`) |
 | T1 — trim tokio `"full"` features | performance | open | `Cargo.toml` |
 | T2 — drop per-login allocations in USERPASS auth | performance | open | `src/lib.rs` |
 | T3 — parse + `USERPASS` lookup benchmarks | performance | open | `benches/` |
