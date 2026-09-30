@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -954,7 +959,10 @@ where
                             break;
                         }
                     };
-                    let data = &buf[..n];
+                    let Some(data) = buf.get(..n) else {
+                        // `recv_from` never reports more than the buffer holds.
+                        continue;
+                    };
 
                     match client_addr {
                         None => {
@@ -1005,7 +1013,8 @@ where
                             }
                         };
                     if let Some(dest) = target.first()
-                        && let Err(e) = socket.send_to(&data[consumed..], *dest).await
+                        && let Some(payload) = data.get(consumed..)
+                        && let Err(e) = socket.send_to(payload, *dest).await
                     {
                         warn!("UDP forward to {} failed: {}", dest, e);
                     }
@@ -1074,44 +1083,24 @@ async fn addr_to_socket(
 ) -> io::Result<Vec<SocketAddr>> {
     match addr_type {
         AddrType::V6 => {
-            if addr.len() < 16 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IPv6 address must be 16 bytes",
-                ));
-            }
-            let new_addr = (0..8)
-                .map(|x| {
-                    trace!("{} and {}", x * 2, (x * 2) + 1);
-                    (u16::from(addr[x * 2]) << 8) | u16::from(addr[(x * 2) + 1])
-                })
-                .collect::<Vec<u16>>();
+            let octets = <[u8; 16]>::try_from(addr).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "IPv6 address must be 16 bytes")
+            })?;
 
             Ok(vec![SocketAddr::from(SocketAddrV6::new(
-                Ipv6Addr::new(
-                    new_addr[0],
-                    new_addr[1],
-                    new_addr[2],
-                    new_addr[3],
-                    new_addr[4],
-                    new_addr[5],
-                    new_addr[6],
-                    new_addr[7],
-                ),
+                Ipv6Addr::from(octets),
                 port,
                 0,
                 0,
             ))])
         }
         AddrType::V4 => {
-            if addr.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IPv4 address must be 4 bytes",
-                ));
-            }
+            let octets = <[u8; 4]>::try_from(addr).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "IPv4 address must be 4 bytes")
+            })?;
+
             Ok(vec![SocketAddr::from(SocketAddrV4::new(
-                Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
+                Ipv4Addr::from(octets),
                 port,
             ))])
         }
@@ -1147,26 +1136,22 @@ fn sanitize_domain(addr: &[u8]) -> String {
 pub fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
     match addr_type {
         AddrType::Domain => sanitize_domain(addr),
-        AddrType::V4 => {
-            if addr.len() < 4 {
-                return format!("<invalid ipv4: {} bytes>", addr.len());
-            }
-            addr.iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<String>>()
-                .join(".")
-        }
+        AddrType::V4 => match addr {
+            [a, b, c, d, ..] => format!("{a}.{b}.{c}.{d}"),
+            _ => format!("<invalid ipv4: {} bytes>", addr.len()),
+        },
         AddrType::V6 => {
-            if addr.len() < 16 {
+            let Some(octets) = addr
+                .get(..16)
+                .and_then(|first| <[u8; 16]>::try_from(first).ok())
+            else {
                 return format!("<invalid ipv6: {} bytes>", addr.len());
-            }
-            let addr_16 = (0..8)
-                .map(|x| (u16::from(addr[x * 2]) << 8) | u16::from(addr[(x * 2) + 1]))
-                .collect::<Vec<u16>>();
+            };
 
-            addr_16
+            Ipv6Addr::from(octets)
+                .segments()
                 .iter()
-                .map(|x| format!("{:x}", x))
+                .map(|segment| format!("{segment:x}"))
                 .collect::<Vec<String>>()
                 .join(":")
         }
@@ -1176,19 +1161,23 @@ pub fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
 /// Extract a concrete IP from a request address, or `None` when the address is
 /// a domain or the unspecified address (`0.0.0.0` / `::`), meaning "any".
 fn expected_ip(addr_type: &AddrType, addr: &[u8]) -> Option<IpAddr> {
-    match addr_type {
-        AddrType::V4 if addr.len() >= 4 => {
-            let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
-            (!ip.is_unspecified()).then_some(IpAddr::V4(ip))
+    let ip = match addr_type {
+        AddrType::V4 => {
+            let octets = addr
+                .get(..4)
+                .and_then(|first| <[u8; 4]>::try_from(first).ok())?;
+            IpAddr::V4(Ipv4Addr::from(octets))
         }
-        AddrType::V6 if addr.len() >= 16 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&addr[..16]);
-            let ip = Ipv6Addr::from(octets);
-            (!ip.is_unspecified()).then_some(IpAddr::V6(ip))
+        AddrType::V6 => {
+            let octets = addr
+                .get(..16)
+                .and_then(|first| <[u8; 16]>::try_from(first).ok())?;
+            IpAddr::V6(Ipv6Addr::from(octets))
         }
-        _ => None,
-    }
+        AddrType::Domain => return None,
+    };
+
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// A parsed RFC 1928 §7 UDP request header.
@@ -1206,60 +1195,23 @@ pub struct UdpRequest<'a> {
 /// Returns the header and the number of bytes consumed; the remaining bytes are
 /// the datagram payload.
 pub fn parse_udp_header(bytes: &[u8]) -> Result<(UdpRequest<'_>, usize), MerinoError> {
-    if bytes.len() < 4 {
+    let [_rsv, _rsv2, frag, atyp, rest @ ..] = bytes else {
         return Err(truncated());
-    }
-    let frag = bytes[2];
-    let addr_type = AddrType::from(bytes[3] as usize)
+    };
+    let addr_type = AddrType::from(usize::from(*atyp))
         .ok_or(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))?;
 
-    let mut pos = 4;
-    let addr: &[u8] = match addr_type {
-        AddrType::Domain => {
-            if bytes.len() < pos + 1 {
-                return Err(truncated());
-            }
-            let dlen = usize::from(bytes[pos]);
-            pos += 1;
-            if bytes.len() < pos + dlen {
-                return Err(truncated());
-            }
-            let addr = &bytes[pos..pos + dlen];
-            pos += dlen;
-            addr
-        }
-        AddrType::V4 => {
-            if bytes.len() < pos + 4 {
-                return Err(truncated());
-            }
-            let addr = &bytes[pos..pos + 4];
-            pos += 4;
-            addr
-        }
-        AddrType::V6 => {
-            if bytes.len() < pos + 16 {
-                return Err(truncated());
-            }
-            let addr = &bytes[pos..pos + 16];
-            pos += 16;
-            addr
-        }
-    };
-
-    if bytes.len() < pos + 2 {
-        return Err(truncated());
-    }
-    let port = (u16::from(bytes[pos]) << 8) | u16::from(bytes[pos + 1]);
-    pos += 2;
+    let (addr, rest) = take_addr(rest, addr_type)?;
+    let (port, rest) = take_port(rest)?;
 
     Ok((
         UdpRequest {
-            frag,
+            frag: *frag,
             addr_type,
             addr,
             port,
         },
-        pos,
+        bytes.len() - rest.len(),
     ))
 }
 
@@ -1296,6 +1248,38 @@ pub struct SOCKSReq {
 
 /// Error used by the pure parsers when a message ends before all of its
 /// declared fields have been read.
+/// Split the first `len` bytes off the front of a frame.
+///
+/// Everything the parsers take off the wire goes through here, so the bounds
+/// check lives in one place instead of at every indexing site.
+fn take(bytes: &[u8], len: usize) -> Result<(&[u8], &[u8]), MerinoError> {
+    if bytes.len() < len {
+        return Err(truncated());
+    }
+    Ok(bytes.split_at(len))
+}
+
+/// Take the address described by `addr_type` off the front of a frame,
+/// returning it with the bytes that follow.
+fn take_addr(bytes: &[u8], addr_type: AddrType) -> Result<(&[u8], &[u8]), MerinoError> {
+    match addr_type {
+        AddrType::Domain => match bytes {
+            [dlen, rest @ ..] => take(rest, usize::from(*dlen)),
+            [] => Err(truncated()),
+        },
+        AddrType::V4 => take(bytes, 4),
+        AddrType::V6 => take(bytes, 16),
+    }
+}
+
+/// Take a big-endian port off the front of a frame.
+fn take_port(bytes: &[u8]) -> Result<(u16, &[u8]), MerinoError> {
+    match bytes {
+        [hi, lo, rest @ ..] => Ok((u16::from(*hi) << 8 | u16::from(*lo), rest)),
+        _ => Err(truncated()),
+    }
+}
+
 pub(crate) fn truncated() -> MerinoError {
     MerinoError::Io(io::Error::new(
         io::ErrorKind::UnexpectedEof,
@@ -1323,16 +1307,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Returns `(version, nmethods, methods, consumed)`. Only the bytes belonging
 /// to the greeting are inspected; trailing pipelined data is left untouched.
 pub fn parse_greeting(bytes: &[u8]) -> Result<(u8, u8, Vec<u8>, usize), MerinoError> {
-    if bytes.len() < 2 {
+    let [version, nmethods, rest @ ..] = bytes else {
         return Err(truncated());
-    }
-    let version = bytes[0];
-    let nmethods = bytes[1];
-    let consumed = 2 + usize::from(nmethods);
-    if bytes.len() < consumed {
-        return Err(truncated());
-    }
-    Ok((version, nmethods, bytes[2..consumed].to_vec(), consumed))
+    };
+    let methods = take(rest, usize::from(*nmethods))?.0.to_vec();
+    let consumed = 2 + methods.len();
+
+    Ok((*version, *nmethods, methods, consumed))
 }
 
 /// A parsed USERPASS sub-negotiation frame.
@@ -1348,36 +1329,24 @@ pub struct UserPassRequest<'a> {
 ///
 /// Returns the parsed request and the number of bytes consumed.
 pub fn parse_userpass(bytes: &[u8]) -> Result<(UserPassRequest<'_>, usize), MerinoError> {
-    if bytes.len() < 2 {
+    let [version, ulen, rest @ ..] = bytes else {
         return Err(truncated());
-    }
-    let version = bytes[0];
-    let ulen = usize::from(bytes[1]);
-    let mut pos = 2;
-    if bytes.len() < pos + ulen {
-        return Err(truncated());
-    }
-    let username = &bytes[pos..pos + ulen];
-    pos += ulen;
+    };
 
-    if bytes.len() < pos + 1 {
+    let (username, rest) = take(rest, usize::from(*ulen))?;
+
+    let [plen, rest @ ..] = rest else {
         return Err(truncated());
-    }
-    let plen = usize::from(bytes[pos]);
-    pos += 1;
-    if bytes.len() < pos + plen {
-        return Err(truncated());
-    }
-    let password = &bytes[pos..pos + plen];
-    pos += plen;
+    };
+    let (password, rest) = take(rest, usize::from(*plen))?;
 
     Ok((
         UserPassRequest {
-            version,
+            version: *version,
             username,
             password,
         },
-        pos,
+        bytes.len() - rest.len(),
     ))
 }
 
@@ -1388,63 +1357,26 @@ pub fn parse_userpass(bytes: &[u8]) -> Result<(UserPassRequest<'_>, usize), Meri
 /// derived from `ATYP`, and the slice must contain exactly that many address
 /// bytes plus the two port bytes; anything short yields `truncated()`.
 pub fn parse_request(bytes: &[u8]) -> Result<(SOCKSReq, usize), MerinoError> {
-    if bytes.len() < 4 {
+    let [version, command, _rsv, atyp, rest @ ..] = bytes else {
         return Err(truncated());
-    }
-    let version = bytes[0];
-    let command = SockCommand::from(bytes[1] as usize)
+    };
+    let command = SockCommand::from(usize::from(*command))
         .ok_or(MerinoError::Socks(ResponseCode::CommandNotSupported))?;
-    let addr_type = AddrType::from(bytes[3] as usize)
+    let addr_type = AddrType::from(usize::from(*atyp))
         .ok_or(MerinoError::Socks(ResponseCode::AddrTypeNotSupported))?;
 
-    let mut pos = 4;
-    let addr: Vec<u8> = match addr_type {
-        AddrType::Domain => {
-            if bytes.len() < pos + 1 {
-                return Err(truncated());
-            }
-            let dlen = usize::from(bytes[pos]);
-            pos += 1;
-            if bytes.len() < pos + dlen {
-                return Err(truncated());
-            }
-            let addr = bytes[pos..pos + dlen].to_vec();
-            pos += dlen;
-            addr
-        }
-        AddrType::V4 => {
-            if bytes.len() < pos + 4 {
-                return Err(truncated());
-            }
-            let addr = bytes[pos..pos + 4].to_vec();
-            pos += 4;
-            addr
-        }
-        AddrType::V6 => {
-            if bytes.len() < pos + 16 {
-                return Err(truncated());
-            }
-            let addr = bytes[pos..pos + 16].to_vec();
-            pos += 16;
-            addr
-        }
-    };
-
-    if bytes.len() < pos + 2 {
-        return Err(truncated());
-    }
-    let port = (u16::from(bytes[pos]) << 8) | u16::from(bytes[pos + 1]);
-    pos += 2;
+    let (addr, rest) = take_addr(rest, addr_type)?;
+    let (port, rest) = take_port(rest)?;
 
     Ok((
         SOCKSReq {
-            version,
+            version: *version,
             command,
             addr_type,
-            addr,
+            addr: addr.to_vec(),
             port,
         },
-        pos,
+        bytes.len() - rest.len(),
     ))
 }
 
@@ -1542,7 +1474,14 @@ impl SOCKSReq {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // Tests may index for brevity: a panic here is a failed test, not a
+    // production hazard.
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};

@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), deny(warnings))]
 #![warn(clippy::all)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #[macro_use]
 extern crate log;
 
@@ -221,7 +226,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use clap::Parser;

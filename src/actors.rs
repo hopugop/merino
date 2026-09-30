@@ -103,9 +103,9 @@ impl SocksServer {
         self.max_connections = max.max(1);
     }
 
-    /// Address of the first listener.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.bound_addrs[0]
+    /// Address of the first listener, or `None` if none is bound.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.bound_addrs.first().copied()
     }
 
     /// Address of every listener this server is bound to.

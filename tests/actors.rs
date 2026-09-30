@@ -12,7 +12,7 @@ async fn start_actors(auth_methods: Vec<u8>, users: Vec<User>) -> SocketAddr {
     let server = SocksServer::bind(0, "127.0.0.1", auth_methods, users, None)
         .await
         .expect("failed to bind SocksServer");
-    let addr = server.local_addr();
+    let addr = server.local_addr().expect("failed to read local addr");
     server.start();
     addr
 }

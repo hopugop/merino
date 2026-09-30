@@ -272,7 +272,7 @@ async fn actix_connection_cap_throttles_excess_clients() {
     .await
     .expect("failed to bind SocksServer");
     server.set_max_connections(1);
-    let addr = server.local_addr();
+    let addr = server.local_addr().expect("failed to read local addr");
     server.start();
 
     // Occupy the only slot: the connection stays in negotiation waiting for
