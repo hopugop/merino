@@ -75,7 +75,7 @@ docker container run --pull=always --name=merino -p=8001:8001 ghcr.io/hopugop/me
 # Unit + integration tests (protocol parsing, NOAUTH/USERPASS, CONNECT relay)
 cargo test
 
-# End-to-end SOCKS5 handshake/relay benchmark (criterion)
+# End-to-end handshake/relay and per-stage parse/DNS/lookup benchmarks
 cargo bench
 
 # Lints
@@ -89,7 +89,23 @@ cargo llvm-cov --all-targets --html
 See [`AGENTS/ROADMAP.md`](AGENTS/ROADMAP.md) for the detailed roadmap,
 [`AGENTS/PLAN.md`](AGENTS/PLAN.md) for the implementation plan, and
 [`AGENTS/HARDENING.md`](AGENTS/HARDENING.md) for the security/hardening plan
-(fuzzing, property tests, Miri, supply-chain checks).
+(fuzzing, property tests, Miri, ASan/TSan, supply-chain checks).
+
+### Hardening / performance flags
+
+Both are off by default; the defaults keep the previous behaviour exactly.
+
+```bash
+# Cap simultaneous connections per source IP (0 = unlimited)
+merino --no-auth --max-connections-per-ip 64
+
+# Cache successful DNS lookups for 60s, at most 512 names
+merino --no-auth --dns-cache-ttl 60 --dns-cache-entries 512
+```
+
+The DNS cache trades DNS-rebinding fidelity for latency: `getaddrinfo` does not
+expose record TTLs, so entries live for `--dns-cache-ttl` rather than the
+authoritative TTL, and only successful lookups are stored.
 
 # 🚥 Roadmap
 

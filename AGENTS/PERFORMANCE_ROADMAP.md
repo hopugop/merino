@@ -25,7 +25,7 @@ linked, not duplicated.
 | T1 — trim tokio `"full"` features | performance | done | `Cargo.toml` (2.52 → 2.01 MB release binary) |
 | T2 — drop per-login allocations in USERPASS auth | performance | done | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
 | T3 — parse + `USERPASS` lookup benchmarks | performance | done | `benches/parse.rs` |
-| T4 — optional DNS cache for `Domain` CONNECT | performance | open | `src/lib.rs` |
+| T4 — optional DNS cache for `Domain` CONNECT | performance | done | `src/lib.rs` (`DnsCache`, `--dns-cache-ttl`) |
 | T5 — de-duplicate the two accept loops | maintenance | done | `src/lib.rs` (`accept_loop`), `src/actors.rs` |
 
 Cross-referenced, already-tracked work (see `HARDENING.md` → *Remaining open
@@ -238,6 +238,15 @@ DNS-rebinding fidelity for latency. For a security-minded proxy this is likely
 **not** worth it unless real-world profiling shows DNS dominates handshake
 latency. Treat as a measurement-first item: profile first, implement only if
 the data supports it.
+
+**Outcome (measured, then implemented).** `benches/parse.rs` now measures
+`lookup_host`: 233 µs for `localhost` and 346–529 µs for real names, against
+~50–110 µs for the rest of the handshake — DNS is the dominant cost, so the
+data supported it. It landed **opt-in and off by default**
+(`--dns-cache-ttl`, `--dns-cache-entries`), positive answers only, bounded with
+expiry-then-oldest eviction. `getaddrinfo` does not expose record TTLs, so the
+cache honours a configured TTL rather than the authoritative one; that is
+documented on `DnsCache` and is the reason the default stays off.
 
 **Acceptance (if pursued).** Cache honours TTL, bounds memory and entry count,
 is configurable, and never caches negative results.

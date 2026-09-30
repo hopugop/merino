@@ -159,19 +159,21 @@ cargo llvm-cov --locked --all-targets --fail-under-lines 95
 
 ## Result
 
-All five batches are done. Final verification:
+All batches are done, plus the hardening follow-ups from `HARDENING.md` (which
+now lists every one of them as resolved). Final verification:
 
 ```
 Filename      Regions    Cover   Functions  Cover    Lines    Cover
-actors.rs         104   96.15%          12  100.00%     76    97.37%
-lib.rs           2261   93.10%         149   99.33%   1333    95.72%
-main.rs           355   99.15%          23  100.00%    219    99.54%
-TOTAL            2720   94.01%         184   99.46%   1628    96.31%
+actors.rs         125   96.80%          16  100.00%     91    97.80%
+lib.rs           2594   93.68%         177   99.44%   1490    95.57%
+main.rs           364   99.18%          23  100.00%    226    99.56%
+TOTAL            3083   94.45%         216   99.54%   1807    96.18%
 ```
 
-128 tests pass, `cargo clippy --all-targets -D warnings` is clean, and coverage
-is above the 95% gate (Batch A: 96.22%, Batch C: 96.09%, after T5: 96.31%). The
-release binary shrank from 2,524,536 to 2,011,928 bytes with T1.
+135 tests pass, `cargo clippy --all-targets -D warnings` is clean, coverage is
+above the 95% gate, and the release binary shrank from 2,524,536 to 2,011,928
+bytes with T1. The five fuzz targets were re-run after the parser rewrite that
+`indexing_slicing` required (~10M executions each, clean).
 
 ### Benchmark baseline (`cargo bench --bench parse`)
 

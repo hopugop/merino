@@ -19,7 +19,7 @@ Each phase is independently committable and verifiable.
 | B — property tests | done | `tests/properties.rs` |
 | C — fuzzing | done | `fuzz/` (5 targets, `forbid(unsafe_code)`, smoke-run clean) |
 | D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml`, `cargo geiger` baseline |
-| E — dynamic/static hardening | mostly | clippy restriction denies + Miri in CI; ASan/TSan pending |
+| E — dynamic/static hardening | done | clippy restriction denies (incl. `indexing_slicing`), Miri + ASan/TSan in CI |
 | F — code coverage | done | `cargo-llvm-cov` + `coverage` job in `.github/workflows/security.yml`, gated at 95% lines (2026-09-30: 96.08% lines / 94.00% regions, see `AGENTS/COVERAGE_PLAN.md`) |
 | G1–G7 fixes | done | see "Product fixes" below |
 
@@ -204,21 +204,37 @@ sockets.
 
 ## Remaining open items
 
-The follow-up items below (sanitizers, indexing lints, per-IP throttling,
-timing hardening) and additional gaps found in a later review pass are tracked
-in [`PERFORMANCE_ROADMAP.md`](PERFORMANCE_ROADMAP.md) with priorities and
-acceptance criteria.
+All the follow-ups below are now done; each is recorded here with what it
+costs and what it does not cover. The one remaining deliberate exclusion is the
+`socks5` middleware/ACL layer (see `ROADMAP.md` item 2), which is a feature
+rather than a hardening follow-up.
 
-- **Sanitizers.** No ASan/TSan nightly job yet; Miri covers the pure tests but
-  not the async/network paths.
-- **`clippy::indexing_slicing`.** Not yet denied: the parsers and
-  `addr_to_socket` still index slices directly. The length guards plus fuzzing
-  make this safe today, but converting to `get`/array patterns would let the
-  lint be enabled.
-- **Per-IP rate limiting.** The cap is global; a single source can still
-  occupy all slots. A per-IP throttle/ACL belongs with the middleware work.
-- **Timing hardening.** `ct_eq` still reveals string length; consider a
-  fixed-length comparison if usernames/passwords are high value.
+- **Sanitizers — done.** `.github/workflows/security.yml` gains a nightly
+  `ASan / TSan` job: ASan runs the whole suite as-is; TSan needs
+  `-Zbuild-std` (TSan changes `core`'s ABI, so plain `RUSTFLAGS` trips
+  "mixing -Zsanitizer" in every dependency) and skips doctests for the same
+  reason. Both runs were clean locally: 129 tests each.
+- **`clippy::indexing_slicing` — done.** Denied in both the library and the
+  binary; every indexing and slicing site in production code was replaced with
+  `take`/`take_addr`/`take_port`, slice patterns, `<[u8; N]>::try_from` and
+  `get(..)`. The in-crate test modules keep an `allow` (a panic there is a
+  failed test, not a production hazard). `SocksServer::local_addr` now returns
+  `Option<SocketAddr>` instead of indexing `bound_addrs`.
+- **Timing hardening — done, with a measured cost.** `ct_eq` compares over a
+  fixed width (the server's longest stored credential) instead of
+  short-circuiting on unequal lengths, so timing no longer reveals the stored
+  credential length. The width is computed once per server. Cost:
+  `benches/parse.rs` measures 1.75x on the 10k-user lookup (110 -> 193 µs of
+  lookup, p = 0.00) and nothing measurable for a small list. Padding to the
+  255-byte wire maximum instead measured 46x (4.1 ms) and was rejected —
+  it turns every login attempt into a CPU amplifier. A digest-based comparison
+  would be cheaper but needs a new dependency.
+- **Per-IP rate limiting — done (the narrow part).** The shared accept loop
+  gained an optional cap of simultaneous connections per source IP
+  (`--max-connections-per-ip`), with slots released by an RAII guard. Excess
+  connections are closed, not queued. This closes "one host occupies every
+  slot". Address/command **policy** (CIDR allow/deny, rewriting) is still the
+  middleware item and is not attempted here.
 
 ## Verification
 
