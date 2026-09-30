@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 /// Version of socks
@@ -39,6 +40,14 @@ const RESERVED: u8 = 0x00;
 /// too short for any destination beyond the local network and was misreported as
 /// a connection refusal.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Head start given to the first outbound connect attempt before the remaining
+/// addresses begin to race it (RFC 8305 "Happy Eyeballs" recommendation).
+///
+/// The first address in `getaddrinfo` order is usually the one the destination
+/// prefers (typically IPv6); 250 ms is long enough for a healthy path to win
+/// immediately while still bailing out quickly when that path is blackholed.
+const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// Default maximum number of client connections handled at once.
 ///
@@ -1018,13 +1027,10 @@ where
                 let time_out = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
                 let mut target =
-                    timeout(
-                        time_out,
-                        async move { TcpStream::connect(&sock_addr[..]).await },
-                    )
-                    .await
-                    .map_err(|_| connect_timeout_error())?
-                    .map_err(connect_error)?;
+                    timeout(time_out, connect_any(&sock_addr))
+                        .await
+                        .map_err(|_| connect_timeout_error())?
+                        .map_err(connect_error)?;
 
                 trace!("Connected!");
 
@@ -1270,6 +1276,76 @@ fn connect_error(error: io::Error) -> MerinoError {
             MerinoError::Socks(ResponseCode::HostUnreachable)
         }
         _ => MerinoError::Io(error),
+    }
+}
+
+/// Establish a TCP connection to the first address in `addrs` that accepts,
+/// racing every remaining address after a short head start (RFC 8305
+/// "Happy Eyeballs").
+///
+/// A strictly-ordered [`TcpStream::connect`] over the whole list hangs when
+/// the first address is *blackholed* — routable, but with packets silently
+/// dropped (for example an IPv6 prefix the upstream no longer forwards). The
+/// kernel then burns its full SYN-retry window (minutes) before reporting an
+/// error, so the caller's connection timeout expires and the IPv4 addresses
+/// later in the list are never tried at all. Racing the remaining addresses
+/// after a 250 ms head start lets a reachable path win while the broken one is
+/// still retrying its SYN.
+///
+/// The first attempt starts immediately; each later attempt starts an extra
+/// [`CONNECT_ATTEMPT_DELAY`] after the previous one. The first successful
+/// connection wins and all other attempts are aborted. When every attempt
+/// fails, the last observed error is returned.
+async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    // A bounded channel lets exactly one outcome be delivered per drain; the
+    // first success the loop receives becomes the winner.
+    let (result_tx, mut result_rx) = mpsc::channel::<io::Result<TcpStream>>(1);
+    let mut attempts = JoinSet::new();
+
+    let mut delay = CONNECT_ATTEMPT_DELAY;
+    for (index, addr) in addrs.iter().copied().enumerate() {
+        if index > 0 {
+            // Stagger the attempts instead of firing them all at once, so a
+            // healthy preferred address still wins on latency alone.
+            tokio::time::sleep(delay).await;
+            delay += CONNECT_ATTEMPT_DELAY;
+        }
+        let tx = result_tx.clone();
+        attempts.spawn(async move {
+            // Every attempt reports its outcome; a slower success cannot
+            // displace the winner because the receiver drains only one.
+            let _ = tx.send(TcpStream::connect(addr).await).await;
+        });
+    }
+    // Drop the sender kept in this scope so `result_rx` observes the channel
+    // closing once every attempt has finished.
+    drop(result_tx);
+
+    let mut last_error: Option<io::Error> = None;
+    loop {
+        match result_rx.recv().await {
+            Some(Ok(stream)) => {
+                // The race is decided: cancel attempts still waiting so no
+                // blackholed SYN keeps a task (and its socket) alive.
+                attempts.abort_all();
+                return Ok(stream);
+            }
+            Some(Err(error)) => {
+                // A completed-but-failed attempt: remember the latest failure
+                // and keep waiting for a live connection.
+                last_error = Some(error);
+            }
+            None => {
+                // Every attempt finished and none delivered a stream.
+                attempts.abort_all();
+                return Err(last_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "no address could be connected to",
+                    )
+                }));
+            }
+        }
     }
 }
 
@@ -2572,5 +2648,78 @@ mod tests {
         let port = taken.local_addr().unwrap().port();
         let err = bind_all("127.0.0.1", port).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    /// Acquire a loopback port guaranteed to refuse connections: bind it, read
+    /// the port and drop the listener so nothing is listening anymore.
+    async fn dead_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn connect_any_skips_a_refused_address() {
+        let echo = spawn_loopback_echo().await;
+        let dead = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_loopback_port().await);
+        let addrs = vec![SocketAddr::V4(dead), echo];
+
+        // The first address refuses instantly; the racer must fall through to
+        // the healthy one instead of giving up.
+        let stream = connect_any(&addrs).await.expect("must fall back to echo");
+        assert_eq!(stream.peer_addr().unwrap(), echo);
+    }
+
+    #[tokio::test]
+    async fn connect_any_wins_with_the_first_healthy_address() {
+        let first = spawn_loopback_echo().await;
+        let second = spawn_loopback_echo().await;
+
+        let stream = connect_any(&[first, second])
+            .await
+            .expect("first healthy address must win");
+        assert_eq!(stream.peer_addr().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn connect_any_reports_a_failure_when_every_address_refuses() {
+        let dead_a = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_loopback_port().await);
+        let dead_b = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_loopback_port().await);
+
+        let err = connect_any(&[SocketAddr::V4(dead_a), SocketAddr::V4(dead_b)])
+            .await
+            .expect_err("all-refusing address list must error");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn connect_any_reports_addr_not_available_for_an_empty_list() {
+        let err = connect_any(&[]).await.expect_err("empty list must error");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    /// Spawn a loopback echo server and return its address.
+    async fn spawn_loopback_echo() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
     }
 }
