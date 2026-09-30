@@ -20,13 +20,13 @@ linked, not duplicated.
 | P2 — wire `parse_udp_header` fuzz target into CI | security | done | `fuzz/`, `.github/workflows/security.yml` |
 | P3 — sanitize client bytes in logs | security | done | `src/lib.rs` (`sanitize_domain`) |
 | P4 — bound `handle_client` with the handshake timeout | security | done | `src/lib.rs` (`SOCKClient::handle_client`) |
-| P5 — RFC-correct reply codes for DNS/network errors | security | open | `src/lib.rs` |
+| P5 — RFC-correct reply codes for DNS/network errors | security | done | `src/lib.rs` (`connect_error`, `dns_failure_error`) |
 | P6 — short-circuit failed USERPASS auth | security | done | `src/lib.rs` (`SOCKClient::auth`) |
-| T1 — trim tokio `"full"` features | performance | open | `Cargo.toml` |
+| T1 — trim tokio `"full"` features | performance | done | `Cargo.toml` (2.52 → 2.01 MB release binary) |
 | T2 — drop per-login allocations in USERPASS auth | performance | done | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
 | T3 — parse + `USERPASS` lookup benchmarks | performance | done | `benches/parse.rs` |
 | T4 — optional DNS cache for `Domain` CONNECT | performance | open | `src/lib.rs` |
-| T5 — de-duplicate the two accept loops | maintenance | open | `src/lib.rs`, `src/actors.rs` |
+| T5 — de-duplicate the two accept loops | maintenance | done | `src/lib.rs` (`accept_loop`), `src/actors.rs` |
 
 Cross-referenced, already-tracked work (see `HARDENING.md` → *Remaining open
 items* and `ROADMAP.md` → item 5): per-IP rate limiting, ASan/TSan, Miri on

@@ -18,11 +18,28 @@ Everything here stays inside the existing toolchain: pinned stable via
 | P6 — short-circuit failed USERPASS auth | A | **done** | `src/lib.rs` (`SOCKClient::auth`, `run_client`) |
 | T3 — parse + `USERPASS` lookup benchmarks | C | **done** | `benches/parse.rs` |
 | T2 — drop per-login allocations in USERPASS auth | C | **done** | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
+| P5 — RFC-correct reply codes | B | **done** | `src/lib.rs` (`connect_error`) |
+| T1 — trim tokio `"full"` features | D | **done** | `Cargo.toml` |
+| T5 — de-duplicate the accept loops | E | **done** | `src/lib.rs` (`accept_loop`) |
 
-Deferred on purpose: T1 (Batch D), T5 (Batch E), T4 (measure-first, likely not
-worth it), and the feature-sized `ROADMAP.md` items (`GSSAPI`, middleware,
+Deferred: T4 (measure-first, likely not worth it — see the roadmap's own
+caution), and the feature-sized `ROADMAP.md` items (`GSSAPI`, middleware,
 `SOCKS4`/`SOCKS4a`). `HARDENING.md` follow-ups (`ASan`/`TSan`, deny
 `clippy::indexing_slicing`, per-IP throttling) are untouched by this work.
+
+Batches B, D and E were added once A and C landed: **P5** (reply codes),
+**T1** (tokio features) and **T5** (shared accept loop). They need no new
+tests beyond the suite; T1 was additionally verified with
+`cargo tree --no-dev-dependencies -e features -i tokio` (no `fs`/`process` in
+the release graph) and T5 with the two connection-cap tests in
+`tests/hardening.rs`.
+
+## Gap found while doing P5 (not fixed)
+
+`addr_to_socket`'s `InvalidInput` arm reports a malformed address as a generic
+`Failure` (`0x01`) rather than `Addr Type not supported` (`0x08`).
+`parse_request` already validates frame lengths, so it is unreachable from the
+wire; worth revisiting only if those guards are ever relaxed.
 
 ---
 
@@ -142,18 +159,19 @@ cargo llvm-cov --locked --all-targets --fail-under-lines 95
 
 ## Result
 
-Both batches are done. Verification after Batch C:
+All five batches are done. Final verification:
 
 ```
 Filename      Regions    Cover   Functions  Cover    Lines    Cover
-actors.rs         128   93.75%          12  100.00%     84    94.05%
-lib.rs           2204   93.28%         142   99.30%   1283    95.64%
+actors.rs         104   96.15%          12  100.00%     76    97.37%
+lib.rs           2261   93.10%         149   99.33%   1333    95.72%
 main.rs           355   99.15%          23  100.00%    219    99.54%
-TOTAL            2687   94.08%         177   99.44%   1586    96.09%
+TOTAL            2720   94.01%         184   99.46%   1628    96.31%
 ```
 
-126 tests pass, `cargo clippy --all-targets -D warnings` is clean, and coverage
-is above the 95% gate (Batch A: 96.22%, Batch C: 96.09%).
+128 tests pass, `cargo clippy --all-targets -D warnings` is clean, and coverage
+is above the 95% gate (Batch A: 96.22%, Batch C: 96.09%, after T5: 96.31%). The
+release binary shrank from 2,524,536 to 2,011,928 bytes with T1.
 
 ### Benchmark baseline (`cargo bench --bench parse`)
 
