@@ -554,14 +554,17 @@ where
 
     /// Check if username + password pair are valid.
     ///
+    /// Takes the raw bytes read off the wire so a login needs no allocation;
+    /// credentials loaded from the CSV are byte-comparable.
+    ///
     /// The comparison is written to avoid early exit on a mismatch and to
     /// inspect every configured user, so the work done does not reveal which
     /// entry (if any) matched or how far a wrong password got.
-    fn authed(&self, user: &User) -> bool {
+    fn authed(&self, username: &[u8], password: &[u8]) -> bool {
         let mut found = false;
         for candidate in self.authed_users.iter() {
-            let username_ok = ct_eq(user.username.as_bytes(), candidate.username.as_bytes());
-            let password_ok = ct_eq(user.password.as_bytes(), candidate.password.as_bytes());
+            let username_ok = ct_eq(username, candidate.username.as_bytes());
+            let password_ok = ct_eq(password, candidate.password.as_bytes());
             found |= username_ok & password_ok;
         }
         found
@@ -688,19 +691,22 @@ where
                 return Err(MerinoError::Socks(ResponseCode::Failure));
             }
 
-            let username = String::from_utf8_lossy(parsed.username).to_string();
-            let password = String::from_utf8_lossy(parsed.password).to_string();
-
-            let user = User { username, password };
-
-            // Authenticate passwords
-            if self.authed(&user) {
-                debug!("Access Granted. User: {}", user.username);
+            // Compare the bytes as they arrived: copying them into `String`s
+            // first allocates twice per login and buys nothing, because CSV
+            // credentials are already byte-comparable.
+            if self.authed(parsed.username, parsed.password) {
+                debug!(
+                    "Access Granted. User: {}",
+                    String::from_utf8_lossy(parsed.username)
+                );
                 let response = [1, ResponseCode::Success as u8];
                 self.stream.write_all(&response).await?;
                 Ok(())
             } else {
-                debug!("Access Denied. User: {}", user.username);
+                debug!(
+                    "Access Denied. User: {}",
+                    String::from_utf8_lossy(parsed.username)
+                );
                 self.replied = true;
                 let response = [1, ResponseCode::Failure as u8];
                 self.stream.write_all(&response).await?;
