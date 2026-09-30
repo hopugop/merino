@@ -451,7 +451,11 @@ where
                 error!("Error! {:?}, client: {:?}", error, client_addr);
             }
 
-            if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await {
+            // A failure the client was already told about during
+            // authentication must not be answered twice.
+            if !client.replied
+                && let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await
+            {
                 if is_disconnect_kind(e.kind()) {
                     debug!("Client already gone, reply not sent: {:?}", e);
                 } else {
@@ -481,6 +485,9 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     /// Local address of the client-facing connection, when known. Used as the
     /// interface to bind `BIND` listeners and `UDP ASSOCIATE` sockets on.
     local_addr: Option<SocketAddr>,
+    /// True once the client has been answered during authentication, so the
+    /// error path in `run_client` does not write a second reply.
+    replied: bool,
 }
 
 impl<T> SOCKClient<T>
@@ -503,6 +510,7 @@ where
             timeout,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             local_addr: None,
+            replied: false,
         }
     }
 
@@ -521,6 +529,7 @@ where
             timeout,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             local_addr: None,
+            replied: false,
         }
     }
 
@@ -663,11 +672,16 @@ where
             frame.extend_from_slice(&password);
             let (parsed, _) = parse_userpass(&frame)?;
 
+            // Answer the client here rather than letting `run_client` do it:
+            // the USERPASS sub-negotiation reply is 2 bytes wide, unlike the
+            // fixed 10-byte SOCKS5 reply. `replied` stops the error path from
+            // answering the same failure a second time.
             if parsed.version != 0x01 {
                 warn!(
                     "Invalid USERPASS sub-negotiation version: {}",
                     parsed.version
                 );
+                self.replied = true;
                 let response = [1, ResponseCode::Failure as u8];
                 self.stream.write_all(&response).await?;
                 self.shutdown().await?;
@@ -684,16 +698,19 @@ where
                 debug!("Access Granted. User: {}", user.username);
                 let response = [1, ResponseCode::Success as u8];
                 self.stream.write_all(&response).await?;
+                Ok(())
             } else {
                 debug!("Access Denied. User: {}", user.username);
+                self.replied = true;
                 let response = [1, ResponseCode::Failure as u8];
                 self.stream.write_all(&response).await?;
 
-                // Shutdown
+                // Shutdown, then fail rather than returning `Ok(())`: reading
+                // a request from an unauthenticated client would let it skip
+                // authentication entirely.
                 self.shutdown().await?;
+                Err(MerinoError::Socks(ResponseCode::Failure))
             }
-
-            Ok(())
         } else if methods.contains(&(AuthMethods::NoAuth as u8)) {
             // set the default auth method (no auth)
             response[1] = AuthMethods::NoAuth as u8;
@@ -1975,6 +1992,53 @@ mod tests {
         drop(peer);
         assert_eq!(relay.await.unwrap().unwrap(), 2);
         echo.abort();
+    }
+
+    #[tokio::test]
+    async fn auth_failure_replies_once_and_closes() {
+        let (mut peer, stream) = tokio::io::duplex(1024);
+        let mut client = SOCKClient::new(
+            stream,
+            Arc::new(vec![User::new("alice", "secret")]),
+            Arc::new(vec![AuthMethods::UserPass as u8]),
+            None,
+        );
+        client.set_handshake_timeout(Duration::from_secs(5));
+
+        let handshake = tokio::spawn(async move { client.init().await });
+
+        // Greeting offering USERPASS.
+        peer.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut selection = [0u8; 2];
+        peer.read_exact(&mut selection).await.unwrap();
+        assert_eq!(selection, [0x05, 0x02]);
+
+        // Wrong password.
+        let mut frame = vec![0x01, 5];
+        frame.extend_from_slice(b"alice");
+        frame.push(6);
+        frame.extend_from_slice(b"wrong!");
+        peer.write_all(&frame).await.unwrap();
+
+        let mut response = [0u8; 2];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x01, 0x01]);
+
+        let err = handshake
+            .await
+            .unwrap()
+            .expect_err("a rejected login must fail the handshake");
+        assert!(matches!(err, MerinoError::Socks(ResponseCode::Failure)));
+
+        // Even if the client pushes a request past the failed login it is not
+        // served, and no second reply follows the failure.
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&80u16.to_be_bytes());
+        let _ = peer.write_all(&request).await;
+
+        let mut trailing = Vec::new();
+        peer.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty(), "unexpected bytes: {trailing:?}");
     }
 
     #[tokio::test]
