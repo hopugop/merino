@@ -199,6 +199,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     server.set_max_connections(opt.max_connections);
     sys.block_on(async move {
         server.start();
+        actix::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutdown signal received, stopping accept loops");
+            actix::System::current().stop();
+        });
+        #[cfg(unix)]
+        actix::spawn(async move {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                && signal.recv().await.is_some()
+            {
+                info!("Shutdown signal received, stopping accept loops");
+                actix::System::current().stop();
+            }
+        });
     });
     sys.run()?;
 
