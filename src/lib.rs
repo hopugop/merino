@@ -715,9 +715,24 @@ where
     ///
     /// Kept for API compatibility; [`SOCKClient::init`] performs the same read
     /// as part of the bounded negotiation and then calls `handle_request`
-    /// directly.
+    /// directly. The read is bounded by
+    /// [`SOCKClient::set_handshake_timeout`] — the same budget `init` applies —
+    /// so callers of this method are not exposed to a client that connects and
+    /// never speaks.
     pub async fn handle_client(&mut self) -> Result<usize, MerinoError> {
-        let req = SOCKSReq::from_stream(&mut self.stream).await?;
+        let req = match timeout(
+            self.handshake_timeout,
+            SOCKSReq::from_stream(&mut self.stream),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("SOCKS request timed out after {:?}", self.handshake_timeout);
+                return Err(MerinoError::Socks(ResponseCode::TtlExpired));
+            }
+        };
+
         self.handle_request(req).await
     }
 
@@ -1960,6 +1975,27 @@ mod tests {
         drop(peer);
         assert_eq!(relay.await.unwrap().unwrap(), 2);
         echo.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_client_times_out_within_the_handshake_budget() {
+        let (peer, stream) = tokio::io::duplex(64);
+        let mut client = SOCKClient::new(
+            stream,
+            Arc::new(Vec::new()),
+            Arc::new(vec![AuthMethods::NoAuth as u8]),
+            None,
+        );
+        client.set_handshake_timeout(Duration::from_millis(50));
+
+        // The peer never speaks, so the read must be abandoned once the
+        // handshake budget runs out instead of hanging forever.
+        let err = client
+            .handle_client()
+            .await
+            .expect_err("a silent client must not be served");
+        assert!(matches!(err, MerinoError::Socks(ResponseCode::TtlExpired)));
+        drop(peer);
     }
 
     #[tokio::test]
