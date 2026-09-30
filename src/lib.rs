@@ -270,38 +270,55 @@ pub(crate) async fn bind_all(ip: &str, port: u16) -> io::Result<Vec<TcpListener>
         .filter(|addr| seen.insert(*addr))
         .collect();
 
-    if addrs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("no addresses resolved for {ip}"),
-        ));
-    }
+    bind_listeners(&addrs).map_err(|e| {
+        if addrs.is_empty() {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {ip}"),
+            )
+        } else {
+            e
+        }
+    })
+}
 
+/// Bind a listener for every address, skipping ones that fail.
+///
+/// Every address is tried even if an earlier one failed; an error is returned
+/// only when none could be bound, reporting the last bind failure.
+pub(crate) fn bind_listeners(addrs: &[SocketAddr]) -> io::Result<Vec<TcpListener>> {
     let mut listeners = Vec::new();
     let mut last_err = None;
     for addr in addrs {
-        match TcpListener::bind(addr).await {
+        match bind_listener(addr) {
             Ok(listener) => {
-                info!("Listening on {}", listener.local_addr()?);
+                if let Ok(bound) = listener.local_addr() {
+                    info!("Listening on {bound}");
+                }
                 listeners.push(listener);
             }
             Err(e) => {
-                warn!("Failed to bind {}: {}", addr, e);
+                warn!("Failed to bind {addr}: {e}");
                 last_err = Some(e);
             }
         }
     }
 
-    if listeners.is_empty() {
-        return Err(last_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                format!("could not bind any address for {ip}:{port}"),
-            )
-        }));
+    if !listeners.is_empty() {
+        return Ok(listeners);
     }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no addresses supplied to bind",
+        )
+    }))
+}
 
-    Ok(listeners)
+fn bind_listener(addr: &SocketAddr) -> io::Result<TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
 }
 
 pub struct Merino {
@@ -1809,6 +1826,106 @@ mod tests {
         assert_eq!(expected_ip(&AddrType::V4, &[0, 0, 0, 0]), None);
         assert_eq!(expected_ip(&AddrType::Domain, b"example.com"), None);
         assert_eq!(expected_ip(&AddrType::V4, &[1, 2]), None);
+    }
+
+    #[test]
+    fn expected_ip_handles_ipv6() {
+        let octets = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        assert_eq!(
+            expected_ip(&AddrType::V6, &octets),
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
+        );
+        assert_eq!(expected_ip(&AddrType::V6, &[0u8; 16]), None);
+        assert_eq!(expected_ip(&AddrType::V6, &[0u8; 8]), None);
+    }
+
+    #[test]
+    fn parse_udp_header_truncates_domain_and_ipv6() {
+        // domain ATYP with no length byte
+        assert!(parse_udp_header(&[0, 0, 0, 0x03]).is_err());
+        // declared domain length exceeds the body
+        assert!(parse_udp_header(&[0, 0, 0, 0x03, 200, b'a']).is_err());
+        // IPv6 ATYP with a short address
+        assert!(parse_udp_header(&[0, 0, 0, 0x04, 1, 2, 3]).is_err());
+        assert!(
+            parse_udp_header(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encode_udp_header_ipv6_roundtrips() {
+        let ip6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let addr = SocketAddr::V6(SocketAddrV6::new(ip6, 4444, 0, 0));
+        let encoded = encode_udp_header(addr);
+        assert_eq!(&encoded[..4], &[0, 0, 0, 0x04]);
+        let (header, consumed) = parse_udp_header(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(header.addr, &ip6.octets()[..]);
+        assert_eq!(header.port, 4444);
+    }
+
+    #[test]
+    fn bind_listeners_reports_empty_input() {
+        let err = bind_listeners(&[]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[tokio::test]
+    async fn bind_listeners_reports_last_failure_when_none_succeed() {
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = vec![a.local_addr().unwrap(), b.local_addr().unwrap()];
+        let err = bind_listeners(&addrs).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_listeners_skips_failed_addresses() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken_addr = taken.local_addr().unwrap();
+        let listeners = bind_listeners(&[taken_addr, "127.0.0.1:0".parse().unwrap()]).unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_ne!(listeners[0].local_addr().unwrap(), taken_addr);
+    }
+
+    #[tokio::test]
+    async fn handle_client_relays_a_prepared_request() {
+        let (mut peer, stream) = tokio::io::duplex(1024);
+        let mut client = SOCKClient::new(
+            stream,
+            Arc::new(Vec::new()),
+            Arc::new(vec![AuthMethods::NoAuth as u8]),
+            None,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let _ = sock.write_all(&buf[..n]).await;
+        });
+
+        let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req.extend_from_slice(&target.port().to_be_bytes());
+        peer.write_all(&req).await.unwrap();
+
+        let relay = tokio::spawn(async move { client.handle_client().await });
+
+        let mut reply = [0u8; 10];
+        peer.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x00);
+
+        peer.write_all(b"hi").await.unwrap();
+        let mut echoed = [0u8; 2];
+        peer.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hi");
+
+        drop(peer);
+        assert_eq!(relay.await.unwrap().unwrap(), 2);
+        echo.abort();
     }
 
     #[tokio::test]

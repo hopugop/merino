@@ -14,11 +14,13 @@ Each phase is independently committable and verifiable.
 | Phase | Status | Where |
 | ----- | ------ | ----- |
 | A — adversarial integration tests | done | `tests/hardening.rs` |
+| A2 — relay protocol branches | done | `tests/relay.rs`, `tests/relay_reset.rs` |
+| A3 — CLI / binary tests | done | `tests/cli.rs` |
 | B — property tests | done | `tests/properties.rs` |
 | C — fuzzing | done | `fuzz/` (5 targets, `forbid(unsafe_code)`, smoke-run clean) |
 | D — supply chain + CI | done | `.github/workflows/security.yml`, `deny.toml`, `cargo geiger` baseline |
 | E — dynamic/static hardening | mostly | clippy restriction denies + Miri in CI; ASan/TSan pending |
-| F — code coverage | done | `cargo-llvm-cov`, `coverage` job in `.github/workflows/security.yml` |
+| F — code coverage | done | `cargo-llvm-cov` + `coverage` job in `.github/workflows/security.yml`, gated at 95% lines (2026-09-30: 96.08% lines / 94.00% regions, see `AGENTS/COVERAGE_PLAN.md`) |
 | G1–G7 fixes | done | see "Product fixes" below |
 
 ## Threat model
@@ -153,15 +155,20 @@ Baseline before this phase was 82.79% of lines (88.67% of regions) with
 `src/main.rs` at 0% because all of its logic lived in `main` behind
 `std::process::exit`. The CLI argument/auth selection and CSV user loading were
 extracted into `log_level_for`, `select_auth_methods`, and `load_users` so they
-are unit-testable without spawning a process. Coverage is now roughly 92% of
-lines (89% of regions) across `src/{lib,actors,main}.rs`; the remaining
-uncovered lines are defensive error paths (accept failures, `copy_bidirectional`
-errors) and the `main` entry point itself, which is only exercised by running
-the binary.
+are unit-testable without spawning a process. A follow-up pass
+(`AGENTS/COVERAGE_PLAN.md`) added duplex-driven relay tests, `bind_listeners`
+for the bind loop, and `tests/cli.rs` binary smoke tests, reaching **96.08% of
+lines / 94.00% of regions / 99.41% of functions** across
+`src/{lib,actors,main}.rs`. The remaining uncovered code is defensive error
+paths only: accept-loop `accept()`/semaphore failures, reply/shutdown failures
+during error handling, `copy_bidirectional` `NotConnected` arms, UDP
+`recv_from`/`send_to` warns, and the "resolved to zero addresses" branch that
+the resolver never actually produces. The binary's graceful Ctrl+C/SIGTERM
+stop path is exercised by `tests/cli.rs`.
 
 CI runs coverage in its own `coverage` job and uploads `lcov.info` plus the
-HTML report as a build artifact. It is informational only — no threshold gate
-yet, so it cannot fail a PR on a coverage regression.
+HTML report as a build artifact. The job gates with `--fail-under-lines 95`
+(baseline 96.08%), so a coverage regression now fails the PR.
 
 ## Product fixes driven by these tests
 
