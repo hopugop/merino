@@ -1292,26 +1292,27 @@ fn connect_error(error: io::Error) -> MerinoError {
 /// after a 250 ms head start lets a reachable path win while the broken one is
 /// still retrying its SYN.
 ///
-/// The first attempt starts immediately; each later attempt starts an extra
-/// [`CONNECT_ATTEMPT_DELAY`] after the previous one. The first successful
-/// connection wins and all other attempts are aborted. When every attempt
-/// fails, the last observed error is returned.
+/// The first attempt starts immediately; each later attempt starts
+/// [`CONNECT_ATTEMPT_DELAY`] after the previous one, with every delay running
+/// concurrently rather than back-to-back (a cumulative loop sleep would take
+/// O(N²): 250 ms · N(N−1)/2, e.g. 47 s for a 20-address answer, longer than
+/// the connect budget). The first successful connection wins and all other
+/// attempts are aborted. When every attempt fails, the last observed error is
+/// returned.
 async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     // A bounded channel lets exactly one outcome be delivered per drain; the
     // first success the loop receives becomes the winner.
     let (result_tx, mut result_rx) = mpsc::channel::<io::Result<TcpStream>>(1);
     let mut attempts = JoinSet::new();
 
-    let mut delay = CONNECT_ATTEMPT_DELAY;
     for (index, addr) in addrs.iter().copied().enumerate() {
-        if index > 0 {
-            // Stagger the attempts instead of firing them all at once, so a
-            // healthy preferred address still wins on latency alone.
-            tokio::time::sleep(delay).await;
-            delay += CONNECT_ATTEMPT_DELAY;
-        }
         let tx = result_tx.clone();
         attempts.spawn(async move {
+            // Each attempt waits its own fixed offset from t=0 before
+            // connecting, so the attempts overlap instead of serialising.
+            if index > 0 {
+                tokio::time::sleep(CONNECT_ATTEMPT_DELAY * index as u32).await;
+            }
             // Every attempt reports its outcome; a slower success cannot
             // displace the winner because the receiver drains only one.
             let _ = tx.send(TcpStream::connect(addr).await).await;
@@ -2697,6 +2698,30 @@ mod tests {
     async fn connect_any_reports_addr_not_available_for_an_empty_list() {
         let err = connect_any(&[]).await.expect_err("empty list must error");
         assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[tokio::test]
+    async fn connect_any_does_not_serialise_many_attempts() {
+        // Attempt delays run concurrently, so a large answer finishes in about
+        // N·250 ms rather than 250 ms·N(N−1)/2. With a dozen refusing
+        // addresses plus one live echo, the old serialised stagger would have
+        // needed ~16.5 s of pure delay; the concurrent one lands near 3 s.
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        for _ in 0..12 {
+            addrs.push(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                dead_loopback_port().await,
+            )));
+        }
+        let echo = spawn_loopback_echo().await;
+        addrs.push(echo);
+
+        let stream = tokio::time::timeout(Duration::from_secs(5), connect_any(&addrs))
+            .await
+            .expect("many-address race must finish well inside the budget")
+            .expect("must fall through to the echo");
+        assert_eq!(stream.peer_addr().unwrap(), echo);
+        assert_eq!(addrs.len(), 13, "test must exercise the multi-address path");
     }
 
     /// Spawn a loopback echo server and return its address.
