@@ -143,6 +143,45 @@ async fn noauth_binary_starts_serves_and_stops() {
 }
 
 #[tokio::test]
+async fn dns_cache_flag_serves_repeated_domain_connects() {
+    // Port 1 is privileged and nothing listens there, so the CONNECT reply is
+    // a refusal rather than a timeout; resolution still has to succeed.
+    // Using a fixed low port avoids borrowing from the ephemeral pool that
+    // other tests bind and drop.
+    let dead: u16 = 1;
+
+    let mut child = spawn(&["--port", "0", "--no-auth", "--dns-cache-ttl", "60"], None);
+    let (addr, _lines) = wait_until_listening(&mut child).await;
+
+    // The second CONNECT of the same name is answered from the cache and must
+    // behave exactly like the first.
+    for attempt in 0..2 {
+        let mut stream = timeout(START_TIMEOUT, tokio::net::TcpStream::connect(addr))
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut selected = [0u8; 2];
+        stream.read_exact(&mut selected).await.unwrap();
+        assert_eq!(selected, [0x05, 0x00]);
+
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, "localhost".len() as u8];
+        req.extend_from_slice(b"localhost");
+        req.extend_from_slice(&dead.to_be_bytes());
+        stream.write_all(&req).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            reply[1], 0x05,
+            "attempt {attempt}: expected connection refused, not a resolution failure"
+        );
+    }
+
+    terminate(&mut child).await;
+}
+
+#[tokio::test]
 async fn no_flags_defaults_to_noauth_and_warns() {
     let mut child = spawn(&["--port", "0"], None);
     let (addr, lines) = wait_until_listening(&mut child).await;

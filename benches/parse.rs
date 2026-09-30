@@ -153,5 +153,30 @@ fn bench_userpass_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parsers, bench_userpass_lookup);
+/// What a `Domain` CONNECT pays before it can even dial: one `getaddrinfo`
+/// round per request. Kept to `localhost` so the bench is offline and
+/// deterministic.
+fn bench_dns_lookup(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("dns");
+    group.sample_size(50);
+    group.bench_function("lookup_host_localhost", |b| {
+        b.to_async(&rt).iter(|| async {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host("localhost:80")
+                .await
+                .expect("localhost must resolve")
+                .collect();
+            assert!(!addrs.is_empty());
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_parsers,
+    bench_userpass_lookup,
+    bench_dns_lookup
+);
 criterion_main!(benches);

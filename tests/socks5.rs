@@ -121,6 +121,44 @@ async fn connect_by_domain_name_succeeds() {
 }
 
 #[tokio::test]
+async fn dns_cache_serves_repeated_domain_connects() {
+    let echo = spawn_echo().await;
+    let mut merino = Merino::new(
+        0,
+        "127.0.0.1",
+        vec![AuthMethods::NoAuth as u8],
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("failed to bind Merino");
+    merino.set_dns_cache(Duration::from_secs(60), 8);
+    let addr = merino.local_addr().expect("failed to read local addr");
+    tokio::spawn(async move {
+        merino.serve().await;
+    });
+
+    // The second connection is answered from the cache; relay must still work.
+    for attempt in 0..2 {
+        let mut stream = connect(addr).await;
+        assert_eq!(greet(&mut stream, &[0x00]).await, 0x00);
+        assert_eq!(
+            request_domain(&mut stream, 0x01, "localhost", echo.port()).await,
+            0x00,
+            "domain connect attempt {attempt} failed"
+        );
+
+        stream.write_all(b"cached dns").await.unwrap();
+        let mut buf = [0u8; 10];
+        timeout(IO_TIMEOUT, stream.read_exact(&mut buf))
+            .await
+            .expect("echo timed out")
+            .unwrap();
+        assert_eq!(&buf, b"cached dns");
+    }
+}
+
+#[tokio::test]
 async fn connect_to_unresolvable_domain_is_host_unreachable() {
     let server = start_no_auth().await;
     let mut stream = connect(server.addr).await;

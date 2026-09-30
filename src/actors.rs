@@ -8,7 +8,9 @@ use actix::prelude::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{DEFAULT_MAX_CONNECTIONS, SOCKClient, User, accept_loop, bind_all, run_client};
+use crate::{
+    DEFAULT_MAX_CONNECTIONS, DnsCache, SOCKClient, User, accept_loop, bind_all, run_client,
+};
 
 /// One actor per accepted TCP connection.
 ///
@@ -68,6 +70,8 @@ pub struct SocksServer {
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
     max_connections: usize,
+    /// Optional positive DNS cache for `Domain` destinations; off by default.
+    dns_cache: Option<Arc<DnsCache>>,
 }
 
 impl SocksServer {
@@ -92,6 +96,7 @@ impl SocksServer {
             users: Arc::new(users),
             timeout,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            dns_cache: None,
         })
     }
 
@@ -101,6 +106,15 @@ impl SocksServer {
     /// before [`Actor::start`].
     pub fn set_max_connections(&mut self, max: usize) {
         self.max_connections = max.max(1);
+    }
+
+    /// Enable the positive DNS cache for `Domain` destinations.
+    ///
+    /// See [`Merino::set_dns_cache`](crate::Merino::set_dns_cache): off by
+    /// default, positive answers only, bounded by `max_entries` and reused for
+    /// `ttl`. Call before [`Actor::start`].
+    pub fn set_dns_cache(&mut self, ttl: Duration, max_entries: usize) {
+        self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
     }
 
     /// Address of the first listener, or `None` if none is bound.
@@ -122,17 +136,20 @@ impl Actor for SocksServer {
         let auth_methods = self.auth_methods.clone();
         let timeout = self.timeout;
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
+        let dns_cache = self.dns_cache.clone();
 
         for listener in std::mem::take(&mut self.listeners) {
             let users = users.clone();
             let auth_methods = auth_methods.clone();
             let semaphore = semaphore.clone();
+            let dns_cache = dns_cache.clone();
             ctx.spawn(fut::wrap_future::<_, SocksServer>(accept_loop(
                 listener,
                 semaphore,
                 users,
                 auth_methods,
                 timeout,
+                dns_cache,
                 |client, peer, permit| {
                     SocksConnection::create(move |_| {
                         let mut connection = SocksConnection::new(client, peer);

@@ -14,11 +14,11 @@ use snafu::Snafu;
 mod actors;
 pub use actors::{SocksConnection, SocksServer};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
@@ -333,6 +333,8 @@ pub struct Merino {
     // Timeout for connections
     timeout: Option<Duration>,
     max_connections: usize,
+    /// Optional positive DNS cache for `Domain` destinations; off by default.
+    dns_cache: Option<Arc<DnsCache>>,
 }
 
 impl Merino {
@@ -350,6 +352,7 @@ impl Merino {
             users: Arc::new(users),
             timeout,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            dns_cache: None,
         })
     }
 
@@ -358,6 +361,16 @@ impl Merino {
     /// Zero is clamped to one so the accept loop can never deadlock.
     pub fn set_max_connections(&mut self, max: usize) {
         self.max_connections = max.max(1);
+    }
+
+    /// Enable the positive DNS cache for `Domain` destinations.
+    ///
+    /// `ttl` bounds how long a resolved name is reused and `max_entries` caps
+    /// the cache size; both are honoured by [`DnsCache`]. Off by default:
+    /// caching client-supplied names trades DNS-rebinding fidelity for
+    /// latency, so it is opt-in. Negative results are never cached.
+    pub fn set_dns_cache(&mut self, ttl: Duration, max_entries: usize) {
+        self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
     }
 
     /// Return the first address a listener is bound to
@@ -383,12 +396,14 @@ impl Merino {
             let auth_methods = self.auth_methods.clone();
             let timeout = self.timeout;
             let semaphore = semaphore.clone();
+            let dns_cache = self.dns_cache.clone();
             set.spawn(accept_loop(
                 listener,
                 semaphore,
                 users,
                 auth_methods,
                 timeout,
+                dns_cache,
                 |client, client_addr, permit| {
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -418,6 +433,7 @@ pub(crate) async fn accept_loop<F>(
     users: Arc<Vec<User>>,
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
+    dns_cache: Option<Arc<DnsCache>>,
     mut on_accept: F,
 ) where
     F: FnMut(SOCKClient<TcpStream>, SocketAddr, OwnedSemaphorePermit) + Send + 'static,
@@ -444,6 +460,9 @@ pub(crate) async fn accept_loop<F>(
                     credential_width,
                 );
                 client.set_local_addr(local_addr);
+                if let Some(cache) = &dns_cache {
+                    client.set_dns_cache(Arc::clone(cache));
+                }
                 on_accept(client, client_addr, permit);
             }
             Err(e) => {
@@ -535,6 +554,8 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     /// the constant-time credential comparison so its cost does not depend on
     /// how long the client's input is.
     credential_width: usize,
+    /// Optional positive DNS cache shared with the rest of the server.
+    dns_cache: Option<Arc<DnsCache>>,
 }
 
 impl<T> SOCKClient<T>
@@ -581,6 +602,7 @@ where
             local_addr: None,
             replied: false,
             credential_width,
+            dns_cache: None,
         }
     }
 
@@ -601,6 +623,7 @@ where
             local_addr: None,
             replied: false,
             credential_width: 0,
+            dns_cache: None,
         }
     }
 
@@ -611,6 +634,11 @@ where
     /// reachable.
     pub fn set_local_addr(&mut self, local_addr: Option<SocketAddr>) {
         self.local_addr = local_addr;
+    }
+
+    /// Share the server's positive DNS cache with this connection.
+    pub(crate) fn set_dns_cache(&mut self, cache: Arc<DnsCache>) {
+        self.dns_cache = Some(cache);
     }
 
     /// Override the maximum time allowed for the SOCKS5 handshake.
@@ -860,12 +888,17 @@ where
                 // `InvalidInput` is the other arm of `addr_to_socket`: a
                 // malformed address, which is a bad request rather than an
                 // unreachable host.
-                let sock_addr = addr_to_socket(&req.addr_type, &req.addr, req.port)
-                    .await
-                    .map_err(|e| match e.kind() {
-                        io::ErrorKind::InvalidInput => MerinoError::Io(e),
-                        _ => dns_failure_error(),
-                    })?;
+                let sock_addr = addr_to_socket(
+                    &req.addr_type,
+                    &req.addr,
+                    req.port,
+                    self.dns_cache.as_deref(),
+                )
+                .await
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::InvalidInput => MerinoError::Io(e),
+                    _ => dns_failure_error(),
+                })?;
 
                 trace!("Connecting to: {:?}", sock_addr);
 
@@ -1050,7 +1083,14 @@ where
                         continue;
                     }
                     let target =
-                        match addr_to_socket(&header.addr_type, header.addr, header.port).await {
+                        match addr_to_socket(
+                            &header.addr_type,
+                            header.addr,
+                            header.port,
+                            self.dns_cache.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(addrs) => addrs,
                             Err(e) => {
                                 warn!("UDP destination resolution failed: {}", e);
@@ -1120,11 +1160,112 @@ fn connect_error(error: io::Error) -> MerinoError {
     }
 }
 
+/// Default lifetime of an entry in the optional DNS cache.
+pub const DEFAULT_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Default entry cap for the optional DNS cache.
+pub const DEFAULT_DNS_CACHE_ENTRIES: usize = 1024;
+
+/// A resolved name held in the DNS cache.
+struct CacheEntry {
+    addrs: Vec<SocketAddr>,
+    expires_at: Instant,
+    inserted_at: Instant,
+}
+
+/// Positive cache for `Domain` destination lookups.
+///
+/// Every domain `CONNECT` or `UDP ASSOCIATE` otherwise pays a full
+/// `getaddrinfo` round (~0.25-0.5 ms measured on loopback, far more than the
+/// rest of the handshake), which is worth avoiding when clients re-resolve the
+/// same handful of names.
+///
+/// Deliberate properties, because caching client-supplied names trades
+/// DNS-rebinding fidelity for latency:
+///
+/// - **Off unless configured.** [`Merino::set_dns_cache`] /
+///   [`SocksServer::set_dns_cache`] enable it; the default is a fresh lookup
+///   per request, preserving the previous behaviour exactly.
+/// - **Only positive answers.** An empty result is never stored, so a name
+///   that failed to resolve is retried next time.
+/// - **Bounded.** At most `max_entries` names; expired entries are dropped
+///   first and the oldest is evicted if that is not enough.
+/// - **TTL is the cache's own, not the record's.** `getaddrinfo` does not
+///   expose the authoritative TTL, so an entry lives for the configured
+///   duration rather than the DNS answer's.
+struct DnsCache {
+    ttl: Duration,
+    max_entries: usize,
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl DnsCache {
+    fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries: max_entries.max(1),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached addresses for `name` when a live entry exists.
+    fn get(&self, name: &str) -> Option<Vec<SocketAddr>> {
+        let mut entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            // A poisoned lock only means some other thread panicked while
+            // updating the cache; falling back to a fresh lookup is safe.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let entry = entries.get(name)?;
+        if entry.expires_at <= Instant::now() {
+            entries.remove(name);
+            return None;
+        }
+        Some(entry.addrs.clone())
+    }
+
+    /// Cache a successful lookup. Empty results are ignored.
+    fn insert(&self, name: String, addrs: &[SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+
+        let mut entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let now = Instant::now();
+        if entries.len() >= self.max_entries {
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= self.max_entries
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.inserted_at)
+                    .map(|(name, _)| name.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+
+        entries.insert(
+            name,
+            CacheEntry {
+                addrs: addrs.to_vec(),
+                expires_at: now + self.ttl,
+                inserted_at: now,
+            },
+        );
+    }
+}
+
 /// Convert an address and AddrType to a SocketAddr
 async fn addr_to_socket(
     addr_type: &AddrType,
     addr: &[u8],
     port: u16,
+    cache: Option<&DnsCache>,
 ) -> io::Result<Vec<SocketAddr>> {
     match addr_type {
         AddrType::V6 => {
@@ -1154,7 +1295,18 @@ async fn addr_to_socket(
             domain.push(':');
             domain.push_str(&port.to_string());
 
-            Ok(lookup_host(domain).await?.collect())
+            if let Some(cache) = cache
+                && let Some(addrs) = cache.get(&domain)
+            {
+                trace!("DNS cache hit for {}", domain);
+                return Ok(addrs);
+            }
+
+            let addrs: Vec<SocketAddr> = lookup_host(domain.clone()).await?.collect();
+            if let Some(cache) = cache {
+                cache.insert(domain, &addrs);
+            }
+            Ok(addrs)
         }
     }
 }
@@ -1694,7 +1846,7 @@ mod tests {
 
     #[tokio::test]
     async fn addr_to_socket_ipv4() {
-        let addr = addr_to_socket(&AddrType::V4, &[127, 0, 0, 1], 8080)
+        let addr = addr_to_socket(&AddrType::V4, &[127, 0, 0, 1], 8080, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1709,7 +1861,9 @@ mod tests {
     #[tokio::test]
     async fn addr_to_socket_ipv6() {
         let raw = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
-        let addr = addr_to_socket(&AddrType::V6, &raw, 443).await.unwrap();
+        let addr = addr_to_socket(&AddrType::V6, &raw, 443, None)
+            .await
+            .unwrap();
         assert_eq!(
             addr,
             vec![SocketAddr::V6(SocketAddrV6::new(
@@ -1905,6 +2059,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dns_cache_returns_positive_entries_only() {
+        let cache = DnsCache::new(Duration::from_secs(60), 8);
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+
+        // Nothing cached yet.
+        assert_eq!(cache.get("example.com:80"), None);
+
+        cache.insert("example.com:80".to_string(), &[addr]);
+        assert_eq!(cache.get("example.com:80"), Some(vec![addr]));
+
+        // A failed lookup must not be remembered: the name is retried.
+        cache.insert("nxdomain.invalid:80".to_string(), &[]);
+        assert_eq!(cache.get("nxdomain.invalid:80"), None);
+        // The port is part of the key.
+        assert_eq!(cache.get("example.com:443"), None);
+    }
+
+    #[test]
+    fn dns_cache_expires_after_its_ttl() {
+        let cache = DnsCache::new(Duration::ZERO, 8);
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        cache.insert("example.com:80".to_string(), &[addr]);
+
+        // Already past its expiry, so it is dropped rather than returned.
+        assert_eq!(cache.get("example.com:80"), None);
+        assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dns_cache_is_bounded_and_evicts_the_oldest() {
+        let cache = DnsCache::new(Duration::from_secs(60), 2);
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+
+        for name in ["first:80", "second:80", "third:80"] {
+            cache.insert(name.to_string(), &[addr]);
+        }
+
+        assert_eq!(cache.entries.lock().unwrap().len(), 2);
+        assert!(cache.get("third:80").is_some(), "newest entry survives");
+    }
+
+    #[test]
+    fn dns_cache_has_at_least_one_slot() {
+        let cache = DnsCache::new(Duration::from_secs(60), 0);
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        cache.insert("example.com:80".to_string(), &[addr]);
+        assert_eq!(cache.get("example.com:80"), Some(vec![addr]));
+    }
+
     #[tokio::test]
     async fn new_no_auth_builds_client() {
         let (_peer, stream) = tokio::io::duplex(64);
@@ -1917,8 +2121,16 @@ mod tests {
 
     #[tokio::test]
     async fn addr_to_socket_rejects_short_addresses() {
-        assert!(addr_to_socket(&AddrType::V4, &[1, 2, 3], 0).await.is_err());
-        assert!(addr_to_socket(&AddrType::V6, &[0u8; 15], 0).await.is_err());
+        assert!(
+            addr_to_socket(&AddrType::V4, &[1, 2, 3], 0, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            addr_to_socket(&AddrType::V6, &[0u8; 15], 0, None)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

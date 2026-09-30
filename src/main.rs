@@ -18,6 +18,7 @@ use std::error::Error;
 use std::io;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Logo to be printed at when merino is run
 const LOGO: &str = r"
@@ -63,6 +64,15 @@ struct Opt {
     /// Maximum number of simultaneous client connections
     #[arg(long, default_value_t = merino::DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
+
+    /// Cache successfully resolved domain names for this many seconds.
+    /// 0 (the default) disables the cache, keeping a fresh lookup per request.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    dns_cache_ttl: u64,
+
+    /// Maximum number of names held in the DNS cache
+    #[arg(long, value_name = "ENTRIES", default_value_t = merino::DEFAULT_DNS_CACHE_ENTRIES)]
+    dns_cache_entries: usize,
 
     /// Log verbosity level. -vv for more verbosity.
     /// Environmental variable `RUST_LOG` overrides this flag!
@@ -202,6 +212,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         None,
     ))?;
     server.set_max_connections(opt.max_connections);
+    if opt.dns_cache_ttl > 0 {
+        server.set_dns_cache(
+            Duration::from_secs(opt.dns_cache_ttl),
+            opt.dns_cache_entries,
+        );
+    }
     sys.block_on(async move {
         server.start();
         actix::spawn(async move {
