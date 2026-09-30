@@ -25,9 +25,26 @@ serde = "1.0.229"
 serde_derive = "1.0.229"
 snafu = "0.9.2"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full"] }
+# Only what the proxy actually uses: the actix multi-thread runtime, TCP/UDP
+# sockets, the AsyncRead/Write helpers, the handshake and connect timeouts, the
+# connection-cap semaphore, graceful-shutdown signals and `select!`.
+# `tokio = "full"` also pulled in `fs`, `process` and more, none of which this
+# crate touches.
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+] }
 
 [dev-dependencies]
+# Tests and benchmarks additionally spawn the binary and build a runtime by
+# hand. Keeping these out of the main feature list means they are enabled for
+# `cargo test` / `cargo bench` only, not for the shipped build.
+tokio = { version = "1.53.1", features = ["process", "rt"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 proptest = "1.11.0"
 
