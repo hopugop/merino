@@ -1027,10 +1027,28 @@ async fn addr_to_socket(
     }
 }
 
+/// Render client-supplied domain bytes for logging.
+///
+/// Names arrive from the network and are logged verbatim (see
+/// `SOCKClient::handle_request`), so anything outside printable ASCII is shown
+/// as a `\xNN` escape. Without this a client could push ANSI escapes or forged
+/// log lines into an operator's terminal. Only the rendered form is escaped —
+/// the bytes on the wire are untouched.
+fn sanitize_domain(addr: &[u8]) -> String {
+    let mut rendered = String::with_capacity(addr.len());
+    for &byte in addr {
+        match byte {
+            0x20..=0x7e => rendered.push(char::from(byte)),
+            _ => rendered.push_str(&format!("\\x{:02x}", byte)),
+        }
+    }
+    rendered
+}
+
 /// Convert an AddrType and address to String
 pub fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
     match addr_type {
-        AddrType::Domain => String::from_utf8_lossy(addr).to_string(),
+        AddrType::Domain => sanitize_domain(addr),
         AddrType::V4 => {
             if addr.len() < 4 {
                 return format!("<invalid ipv4: {} bytes>", addr.len());
@@ -1478,6 +1496,22 @@ mod tests {
             pretty_print_addr(&AddrType::Domain, b"example.com"),
             "example.com"
         );
+    }
+
+    #[test]
+    fn pretty_print_domain_escapes_control_bytes() {
+        // A client-supplied name must never reach a log verbatim: ANSI escape,
+        // CR/LF injection and non-ASCII bytes are all escaped.
+        assert_eq!(
+            pretty_print_addr(&AddrType::Domain, b"\x1b[31mexample.com"),
+            "\\x1b[31mexample.com"
+        );
+        assert_eq!(
+            pretty_print_addr(&AddrType::Domain, b"a\x00b\x0ac\x0dd\xff"),
+            "a\\x00b\\x0ac\\x0dd\\xff"
+        );
+        // Printable ASCII, spaces included, is passed through untouched.
+        assert_eq!(pretty_print_addr(&AddrType::Domain, b"a b~!"), "a b~!");
     }
 
     #[test]
