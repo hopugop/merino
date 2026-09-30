@@ -170,10 +170,17 @@ backend where each association can be its own actor.
 
 ## 5. Benchmarks
 
-**Status: partly complete.** `benches/proxy.rs` (criterion, stable) benchmarks a
-full `NOAUTH` handshake + `CONNECT` relay against a loopback echo server;
-`cargo bench` is documented in `README.md`. Remaining follow-ups: dedicated
-parse micro-benchmarks and `USERPASS` lookup benchmarks, plus a CI bench job.
+**Status: partly complete.** Two criterion harnesses now run on stable:
+
+- `benches/proxy.rs` — full `NOAUTH` handshake + `CONNECT` relay against a
+  loopback echo server.
+- `benches/parse.rs` — per-stage numbers: `parse_greeting`, `parse_userpass`,
+  `parse_request` (IPv4 and worst-case 255-byte domain), `parse_udp_header`,
+  `pretty_print_addr`, plus the real `USERPASS` handshake against 1-user and
+  10k-user servers (see `AGENTS/IMPLEMENTATION_PLAN.md` for the baseline).
+
+`cargo bench` is documented in `README.md`. Remaining follow-up: a non-blocking
+CI bench job (`cargo bench -- --quick` or a criterion baseline).
 
 **Goal.** Track handshake and relay performance and catch regressions.
 

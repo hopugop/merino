@@ -16,8 +16,8 @@ Everything here stays inside the existing toolchain: pinned stable via
 | P3 — sanitize client bytes in logs | A | **done** | `src/lib.rs` (`sanitize_domain`) |
 | P4 — bound `handle_client` with the handshake timeout | A | **done** | `src/lib.rs` (`SOCKClient::handle_client`) |
 | P6 — short-circuit failed USERPASS auth | A | **done** | `src/lib.rs` (`SOCKClient::auth`, `run_client`) |
-| T3 — parse + `USERPASS` lookup benchmarks | C | in progress | `benches/parse.rs` (new) |
-| T2 — drop per-login allocations in USERPASS auth | C | open | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
+| T3 — parse + `USERPASS` lookup benchmarks | C | **done** | `benches/parse.rs` |
+| T2 — drop per-login allocations in USERPASS auth | C | **done** | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
 
 Deferred on purpose: T1 (Batch D), T5 (Batch E), T4 (measure-first, likely not
 worth it), and the feature-sized `ROADMAP.md` items (`GSSAPI`, middleware,
@@ -137,6 +137,43 @@ cargo fmt --all && cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo llvm-cov --locked --all-targets --fail-under-lines 95
 ```
+
+---
+
+## Result
+
+Both batches are done. Verification after Batch C:
+
+```
+Filename      Regions    Cover   Functions  Cover    Lines    Cover
+actors.rs         128   93.75%          12  100.00%     84    94.05%
+lib.rs           2204   93.28%         142   99.30%   1283    95.64%
+main.rs           355   99.15%          23  100.00%    219    99.54%
+TOTAL            2687   94.08%         177   99.44%   1586    96.09%
+```
+
+126 tests pass, `cargo clippy --all-targets -D warnings` is clean, and coverage
+is above the 95% gate (Batch A: 96.22%, Batch C: 96.09%).
+
+### Benchmark baseline (`cargo bench --bench parse`)
+
+Measured for T3, used to check T2:
+
+| Bench | Before T2 | After T2 |
+| ----- | --------- | -------- |
+| `parse/greeting` | 5.80 ns | — (parsers untouched) |
+| `parse/userpass` | 0.98 ns | — |
+| `parse/request_ipv4` | 12.09 ns | — |
+| `parse/request_domain_255` | 16.07 ns | — |
+| `parse/udp_header_domain_255` | 5.44 ns | — |
+| `parse/pretty_print_addr_domain_255` | 144.4 ns | — |
+| `userpass_lookup/1_user` | 53.3 µs | 53.8 µs |
+| `userpass_lookup/10k_users` | 89.7 µs | 89.1 µs |
+
+The loopback TCP handshake dominates the lookup bench by ~3 orders of magnitude
+over the two allocations T2 removes, so its numbers move inside the noise band;
+that item rests on the removed work, not on a measured win. A socket-free lookup
+bench would need `authed` to be public, which is not worth widening the API for.
 
 ---
 

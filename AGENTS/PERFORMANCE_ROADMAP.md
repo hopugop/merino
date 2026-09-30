@@ -23,8 +23,8 @@ linked, not duplicated.
 | P5 — RFC-correct reply codes for DNS/network errors | security | open | `src/lib.rs` |
 | P6 — short-circuit failed USERPASS auth | security | done | `src/lib.rs` (`SOCKClient::auth`) |
 | T1 — trim tokio `"full"` features | performance | open | `Cargo.toml` |
-| T2 — drop per-login allocations in USERPASS auth | performance | open | `src/lib.rs` |
-| T3 — parse + `USERPASS` lookup benchmarks | performance | open | `benches/` |
+| T2 — drop per-login allocations in USERPASS auth | performance | done | `src/lib.rs` (`SOCKClient::auth`, `authed`) |
+| T3 — parse + `USERPASS` lookup benchmarks | performance | done | `benches/parse.rs` |
 | T4 — optional DNS cache for `Domain` CONNECT | performance | open | `src/lib.rs` |
 | T5 — de-duplicate the two accept loops | maintenance | open | `src/lib.rs`, `src/actors.rs` |
 
