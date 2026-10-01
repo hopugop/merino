@@ -616,6 +616,28 @@ fn is_client_disconnect(error: &MerinoError) -> bool {
     matches!(error, MerinoError::Io(io) if is_disconnect_kind(io.kind()))
 }
 
+/// Whether an error only killed this connection rather than the proxy itself.
+///
+/// These are the routine failures a public proxy sees when a client picks an
+/// unreachable, refusing, or blackholed destination: the connect or handshake
+/// budget elapses (`TTL expired`), the remote endpoint rejects the connection
+/// (`connection refused`), the destination name or network is unreachable, or a
+/// relay socket stops answering and the kernel reports `ETIMEDOUT`. The proxy
+/// itself is unaffected — it keeps serving — so these must be logged at INFO,
+/// not as server errors.
+fn is_connection_failure(error: &MerinoError) -> bool {
+    match error {
+        MerinoError::Io(io) => io.kind() == io::ErrorKind::TimedOut,
+        MerinoError::Socks(
+            ResponseCode::NetworkUnreachable
+            | ResponseCode::HostUnreachable
+            | ResponseCode::ConnectionRefused
+            | ResponseCode::TtlExpired,
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Drive a single client connection to completion, replying with an error code
 /// and shutting the stream down when the SOCKS negotiation fails.
 pub(crate) async fn run_client<T>(mut client: SOCKClient<T>, client_addr: SocketAddr)
@@ -626,13 +648,16 @@ where
         Ok(_) => {}
         Err(error) => {
             let disconnected = is_client_disconnect(&error);
-            if disconnected {
-                debug!(
+            let connection_failure = is_connection_failure(&error);
+            match (disconnected, connection_failure) {
+                (true, _) => debug!(
                     "Client disconnected during handshake: {}, client: {:?}",
                     error, client_addr
-                );
-            } else {
-                error!("Error! {:?}, client: {:?}", error, client_addr);
+                ),
+                (false, true) => info!("Connection failed: {:?}, client: {:?}", error, client_addr),
+                (false, false) => {
+                    error!("Error! {:?}, client: {:?}", error, client_addr);
+                }
             }
 
             // A failure the client was already told about during
@@ -2017,6 +2042,37 @@ mod tests {
             "nope"
         ))));
         assert!(!is_disconnect_kind(io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn connection_failures_are_classified() {
+        // Routine per-connection failures must be logged at INFO, not ERROR.
+        for code in [
+            ResponseCode::NetworkUnreachable,
+            ResponseCode::HostUnreachable,
+            ResponseCode::ConnectionRefused,
+            ResponseCode::TtlExpired,
+        ] {
+            assert!(is_connection_failure(&MerinoError::Socks(code)));
+        }
+        assert!(is_connection_failure(&MerinoError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "snooze"
+        ))));
+
+        // Genuine proxy faults and unrelated failures stay at ERROR.
+        assert!(!is_connection_failure(&MerinoError::Socks(
+            ResponseCode::Failure
+        )));
+        assert!(!is_connection_failure(&MerinoError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "nope"
+        ))));
+        // Disconnects belong to the debug bucket, not INFO.
+        assert!(!is_connection_failure(&MerinoError::Io(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "hang up"
+        ))));
     }
 
     #[test]
