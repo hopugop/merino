@@ -12,11 +12,14 @@ extern crate log;
 use snafu::Snafu;
 
 mod actors;
+pub mod stats;
 pub use actors::{SocksConnection, SocksServer};
+pub use stats::{Stats, serve_stats};
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -175,7 +178,7 @@ pub enum MerinoError {
     Socks(#[from] ResponseCode),
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Clone, Copy, Snafu)]
 /// Possible SOCKS5 Response Codes
 pub enum ResponseCode {
     Success = 0x00,
@@ -346,6 +349,8 @@ pub struct Merino {
     dns_cache: Option<Arc<DnsCache>>,
     /// Optional per-source connection cap; off by default.
     per_ip: Option<Arc<PerIpLimiter>>,
+    /// Always-on statistics shared with the web service and each connection.
+    stats: Arc<Stats>,
 }
 
 impl Merino {
@@ -365,7 +370,16 @@ impl Merino {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             dns_cache: None,
             per_ip: None,
+            stats: Arc::new(Stats::new()),
         })
+    }
+
+    /// Share `stats` with the server and every connection it accepts.
+    ///
+    /// The default is a private instance; sharing lets the embedded web
+    /// service serve the same counters (see `--stats-addr`).
+    pub fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = stats;
     }
 
     /// Set the maximum number of simultaneous client connections.
@@ -382,7 +396,9 @@ impl Merino {
     /// caching client-supplied names trades DNS-rebinding fidelity for
     /// latency, so it is opt-in. Negative results are never cached.
     pub fn set_dns_cache(&mut self, ttl: Duration, max_entries: usize) {
-        self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
+        let cache = Arc::new(DnsCache::new(ttl, max_entries));
+        self.stats.register_dns(Arc::clone(&cache));
+        self.dns_cache = Some(cache);
     }
 
     /// Cap how many simultaneous connections a single source IP may hold.
@@ -410,6 +426,12 @@ impl Merino {
 
     pub async fn serve(&mut self) {
         info!("Serving Connections...");
+        let addrs: Vec<SocketAddr> = self
+            .listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .collect();
+        self.stats.note_listeners(&addrs);
         let listeners = std::mem::take(&mut self.listeners);
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
         let mut set = tokio::task::JoinSet::new();
@@ -419,19 +441,22 @@ impl Merino {
             timeout: self.timeout,
             dns_cache: self.dns_cache.clone(),
             per_ip: self.per_ip.clone(),
+            stats: self.stats.clone(),
         };
         for listener in listeners {
             let semaphore = semaphore.clone();
             let ctx = ctx.clone();
+            let run_stats = ctx.stats.clone();
             set.spawn(accept_loop(
                 listener,
                 semaphore,
                 ctx,
-                |client, client_addr, permit, ip_slot| {
+                move |client, client_addr, permit, ip_slot| {
+                    let run_stats = run_stats.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _ip_slot = ip_slot;
-                        run_client(client, client_addr).await;
+                        run_client(client, client_addr, run_stats).await;
                     });
                 },
             ));
@@ -518,6 +543,7 @@ pub(crate) struct ServerContext {
     timeout: Option<Duration>,
     dns_cache: Option<Arc<DnsCache>>,
     per_ip: Option<Arc<PerIpLimiter>>,
+    stats: Arc<Stats>,
 }
 
 /// Accept loop shared by both backends.
@@ -565,6 +591,7 @@ pub(crate) async fn accept_loop<F>(
                                 "Per-IP connection limit reached for {}, closing",
                                 client_addr.ip()
                             );
+                            ctx.stats.note_refused_per_ip();
                             drop(permit);
                             drop(stream);
                             continue;
@@ -582,9 +609,11 @@ pub(crate) async fn accept_loop<F>(
                     credential_width,
                 );
                 client.set_local_addr(local_addr);
+                client.set_stats(Arc::clone(&ctx.stats));
                 if let Some(cache) = &ctx.dns_cache {
                     client.set_dns_cache(Arc::clone(cache));
                 }
+                ctx.stats.note_accepted();
                 on_accept(client, client_addr, permit, ip_slot);
             }
             Err(e) => {
@@ -640,10 +669,15 @@ fn is_connection_failure(error: &MerinoError) -> bool {
 
 /// Drive a single client connection to completion, replying with an error code
 /// and shutting the stream down when the SOCKS negotiation fails.
-pub(crate) async fn run_client<T>(mut client: SOCKClient<T>, client_addr: SocketAddr)
-where
+pub(crate) async fn run_client<T>(
+    mut client: SOCKClient<T>,
+    client_addr: SocketAddr,
+    stats: Arc<Stats>,
+) where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let guard = stats.begin_client(client_addr, client.local_addr);
+    client.client_id = Some(guard.id);
     match client.init().await {
         Ok(_) => {}
         Err(error) => {
@@ -660,10 +694,17 @@ where
                 }
             }
 
+            let code: ResponseCode = error.into();
+            if disconnected {
+                stats.note_disconnect();
+            } else {
+                stats.note_error(code as u8);
+            }
+
             // A failure the client was already told about during
             // authentication must not be answered twice.
             if !client.replied
-                && let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await
+                && let Err(e) = SocksReply::new(code).send(&mut client.stream).await
             {
                 if is_disconnect_kind(e.kind()) {
                     debug!("Client already gone, reply not sent: {:?}", e);
@@ -703,6 +744,12 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     credential_width: usize,
     /// Optional positive DNS cache shared with the rest of the server.
     dns_cache: Option<Arc<DnsCache>>,
+    /// Always-on statistics shared with the rest of the server; `None` in
+    /// standalone clients constructed without a server (tests, benches).
+    stats: Option<Arc<Stats>>,
+    /// Registry id assigned by `run_client`, used to update per-connection
+    /// state in [`Stats`].
+    client_id: Option<u64>,
 }
 
 impl<T> SOCKClient<T>
@@ -750,6 +797,8 @@ where
             replied: false,
             credential_width,
             dns_cache: None,
+            stats: None,
+            client_id: None,
         }
     }
 
@@ -771,6 +820,8 @@ where
             replied: false,
             credential_width: 0,
             dns_cache: None,
+            stats: None,
+            client_id: None,
         }
     }
 
@@ -786,6 +837,11 @@ where
     /// Share the server's positive DNS cache with this connection.
     pub(crate) fn set_dns_cache(&mut self, cache: Arc<DnsCache>) {
         self.dns_cache = Some(cache);
+    }
+
+    /// Share the server's always-on statistics with this connection.
+    pub fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = Some(stats);
     }
 
     /// Override the maximum time allowed for the SOCKS5 handshake.
@@ -846,6 +902,9 @@ where
                     "SOCKS handshake timed out after {:?}",
                     self.handshake_timeout
                 );
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.note_handshake_timeout();
+                }
                 return Err(MerinoError::Socks(ResponseCode::TtlExpired));
             }
         };
@@ -938,6 +997,9 @@ where
                     "Invalid USERPASS sub-negotiation version: {}",
                     parsed.version
                 );
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.note_auth_failure();
+                }
                 self.replied = true;
                 let response = [1, ResponseCode::Failure as u8];
                 self.stream.write_all(&response).await?;
@@ -961,6 +1023,9 @@ where
                     "Access Denied. User: {}",
                     String::from_utf8_lossy(parsed.username)
                 );
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.note_auth_failure();
+                }
                 self.replied = true;
                 let response = [1, ResponseCode::Failure as u8];
                 self.stream.write_all(&response).await?;
@@ -980,6 +1045,9 @@ where
             Ok(())
         } else {
             warn!("Client has no suitable Auth methods!");
+            if let Some(stats) = self.stats.as_ref() {
+                stats.note_auth_failure();
+            }
             response[1] = AuthMethods::NoMethods as u8;
             self.stream.write_all(&response).await?;
             self.shutdown().await?;
@@ -1006,6 +1074,9 @@ where
             Ok(result) => result?,
             Err(_) => {
                 warn!("SOCKS request timed out after {:?}", self.handshake_timeout);
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.note_handshake_timeout();
+                }
                 return Err(MerinoError::Socks(ResponseCode::TtlExpired));
             }
         };
@@ -1023,6 +1094,9 @@ where
             "New Request: Command: {:?} Addr: {}, Port: {}",
             req.command, displayed_addr, req.port
         );
+        if let Some(stats) = self.stats.as_ref() {
+            stats.note_request(self.client_id, req.command);
+        }
 
         // Respond
         match req.command {
@@ -1051,11 +1125,10 @@ where
 
                 let time_out = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
-                let mut target =
-                    timeout(time_out, connect_any(&sock_addr))
-                        .await
-                        .map_err(|_| connect_timeout_error())?
-                        .map_err(connect_error)?;
+                let mut target = timeout(time_out, connect_any(&sock_addr))
+                    .await
+                    .map_err(|_| connect_timeout_error())?
+                    .map_err(connect_error)?;
 
                 trace!("Connected!");
 
@@ -1071,7 +1144,12 @@ where
                         Ok(0)
                     }
                     Err(e) => Err(MerinoError::Io(e)),
-                    Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
+                    Ok((s_to_t, t_to_s)) => {
+                        if let Some(stats) = self.stats.as_ref() {
+                            stats.note_relay(self.client_id, s_to_t, t_to_s);
+                        }
+                        Ok(t_to_s as usize)
+                    }
                 }
             }
             // Listen for a single inbound connection and relay it back.
@@ -1136,7 +1214,12 @@ where
                 Ok(0)
             }
             Err(e) => Err(MerinoError::Io(e)),
-            Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
+            Ok((s_to_t, t_to_s)) => {
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.note_relay(self.client_id, s_to_t, t_to_s);
+                }
+                Ok(t_to_s as usize)
+            }
         }
     }
 
@@ -1207,6 +1290,9 @@ where
                             // with the sender's address and forward to client.
                             let mut out = encode_udp_header(src);
                             out.extend_from_slice(data);
+                            if let Some(stats) = self.stats.as_ref() {
+                                stats.note_udp_reply(out.len() as u64);
+                            }
                             if let Err(e) = socket.send_to(&out, client).await {
                                 warn!("UDP relay to client failed: {}", e);
                             }
@@ -1243,9 +1329,14 @@ where
                         };
                     if let Some(dest) = target.first()
                         && let Some(payload) = data.get(consumed..)
-                        && let Err(e) = socket.send_to(payload, *dest).await
                     {
-                        warn!("UDP forward to {} failed: {}", dest, e);
+                        if let Some(stats) = self.stats.as_ref() {
+                            stats.note_udp_datagram(payload.len() as u64);
+                        }
+                        if let Err(e) = socket.send_to(payload, *dest).await
+                        {
+                            warn!("UDP forward to {} failed: {}", dest, e);
+                        }
                     }
                 }
             }
@@ -1412,6 +1503,11 @@ struct DnsCache {
     ttl: Duration,
     max_entries: usize,
     entries: Mutex<HashMap<String, CacheEntry>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    evictions: AtomicU64,
+    expired_dropped: AtomicU64,
 }
 
 impl DnsCache {
@@ -1420,6 +1516,11 @@ impl DnsCache {
             ttl,
             max_entries: max_entries.max(1),
             entries: Mutex::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            expired_dropped: AtomicU64::new(0),
         }
     }
 
@@ -1432,11 +1533,17 @@ impl DnsCache {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let entry = entries.get(name)?;
+        let Some(entry) = entries.get(name) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         if entry.expires_at <= Instant::now() {
             entries.remove(name);
+            self.expired_dropped.fetch_add(1, Ordering::Relaxed);
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        self.hits.fetch_add(1, Ordering::Relaxed);
         Some(entry.addrs.clone())
     }
 
@@ -1453,7 +1560,18 @@ impl DnsCache {
 
         let now = Instant::now();
         if entries.len() >= self.max_entries {
-            entries.retain(|_, entry| entry.expires_at > now);
+            let mut expired = 0u64;
+            entries.retain(|_, entry| {
+                if entry.expires_at > now {
+                    true
+                } else {
+                    expired += 1;
+                    false
+                }
+            });
+            if expired > 0 {
+                self.expired_dropped.fetch_add(expired, Ordering::Relaxed);
+            }
             if entries.len() >= self.max_entries
                 && let Some(oldest) = entries
                     .iter()
@@ -1461,6 +1579,7 @@ impl DnsCache {
                     .map(|(name, _)| name.clone())
             {
                 entries.remove(&oldest);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1472,6 +1591,37 @@ impl DnsCache {
                 inserted_at: now,
             },
         );
+        self.inserts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Point-in-time view of the cache for the statistics snapshot.
+    fn snapshot(&self) -> crate::stats::DnsSnapshot {
+        let now = Instant::now();
+        let entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut names: Vec<crate::stats::DnsName> = entries
+            .iter()
+            .map(|(name, entry)| crate::stats::DnsName {
+                name: sanitize_domain(name.as_bytes()),
+                expires_in_secs: entry.expires_at.saturating_duration_since(now).as_secs(),
+            })
+            .collect();
+        names.sort_by_key(|name| name.expires_in_secs);
+        names.truncate(crate::stats::TOP_LIST_LEN);
+        crate::stats::DnsSnapshot {
+            enabled: true,
+            ttl_secs: self.ttl.as_secs(),
+            max_entries: self.max_entries,
+            entries: entries.len(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            expired_dropped: self.expired_dropped.load(Ordering::Relaxed),
+            names,
+        }
     }
 }
 
@@ -2375,6 +2525,45 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
         cache.insert("example.com:80".to_string(), &[addr]);
         assert_eq!(cache.get("example.com:80"), Some(vec![addr]));
+    }
+
+    #[test]
+    fn dns_cache_accounts_hits_misses_evictions_and_expiry() {
+        let cache = DnsCache::new(Duration::from_secs(60), 2);
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+
+        // Miss (nothing cached yet), then hits once inserted.
+        assert_eq!(cache.get("example.com:80"), None);
+        cache.insert("example.com:80".to_string(), &[addr]);
+        assert_eq!(cache.get("example.com:80"), Some(vec![addr]));
+        assert_eq!(cache.get("example.com:80"), Some(vec![addr]));
+
+        // Empty results are never cached and still count as a miss.
+        cache.insert("nxdomain.invalid:80".to_string(), &[]);
+        assert_eq!(cache.get("nxdomain.invalid:80"), None);
+
+        // Filling past capacity evicts the oldest entry.
+        cache.insert("a:80".to_string(), &[addr]);
+        cache.insert("b:80".to_string(), &[addr]);
+        cache.insert("c:80".to_string(), &[addr]);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.hits, 2);
+        assert_eq!(snap.misses, 2);
+        assert_eq!(snap.inserts, 4);
+        assert_eq!(snap.evictions, 2);
+        assert_eq!(snap.entries, 2);
+        assert_eq!(snap.names.len(), 2);
+        assert!(snap.enabled);
+        assert_eq!(snap.max_entries, 2);
+
+        // A zero-TTL entry is dropped on read and counted as expired.
+        let expired = DnsCache::new(Duration::ZERO, 8);
+        expired.insert("gone:80".to_string(), &[addr]);
+        assert_eq!(expired.get("gone:80"), None);
+        let snap = expired.snapshot();
+        assert_eq!(snap.expired_dropped, 1);
+        assert_eq!(snap.entries, 0);
     }
 
     #[tokio::test]

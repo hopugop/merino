@@ -581,6 +581,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_derive",
+ "serde_json",
  "snafu",
  "thiserror",
  "tokio",

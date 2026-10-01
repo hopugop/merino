@@ -18,6 +18,7 @@ use std::error::Error;
 use std::io;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Logo to be printed at when merino is run
@@ -78,6 +79,16 @@ struct Opt {
     /// Maximum number of names held in the DNS cache
     #[arg(long, value_name = "ENTRIES", default_value_t = merino::DEFAULT_DNS_CACHE_ENTRIES)]
     dns_cache_entries: usize,
+
+    /// Serve real-time statistics over HTTP (off by default).
+    /// Example: 127.0.0.1:9090. Endpoints: /, /stats, /clients, /healthz.
+    #[arg(long, value_name = "IP:PORT")]
+    stats_addr: Option<String>,
+
+    /// Require this bearer token on every statistics request.
+    /// Recommended whenever --stats-addr binds a non-loopback address.
+    #[arg(long, value_name = "TOKEN")]
+    stats_token: Option<String>,
 
     /// Log verbosity level. -vv for more verbosity.
     /// Environmental variable `RUST_LOG` overrides this flag!
@@ -218,14 +229,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
     server.set_max_connections(opt.max_connections);
     server.set_max_connections_per_ip(opt.max_connections_per_ip);
+
+    // Statistics are always collected; only the HTTP listener is opt-in.
+    let stats_addr: Option<std::net::SocketAddr> = opt
+        .stats_addr
+        .as_deref()
+        .map(|addr| addr.parse())
+        .transpose()?;
+    let stats = Arc::new(merino::Stats::new());
+    stats.note_listeners(server.local_addrs());
+    server.set_stats(stats.clone());
     if opt.dns_cache_ttl > 0 {
         server.set_dns_cache(
             Duration::from_secs(opt.dns_cache_ttl),
             opt.dns_cache_entries,
         );
     }
+    let stats_token: Option<Arc<str>> = opt.stats_token.as_deref().map(Arc::from);
+
     sys.block_on(async move {
         server.start();
+
+        if let Some(addr) = stats_addr {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Failed to bind stats listener on {addr}: {e}");
+                    return Err(e);
+                }
+            };
+            info!("Stats HTTP service listening on {addr}");
+            if !addr.ip().is_loopback() && stats_token.is_none() {
+                warn!(
+                    "Stats HTTP service is exposed on a non-loopback address \
+                    without --stats-token"
+                );
+            }
+            let stats = stats.clone();
+            let token = stats_token.clone();
+            actix::spawn(async move {
+                merino::serve_stats(listener, stats, token).await;
+            });
+        }
+
         actix::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Shutdown signal received, stopping accept loops");
@@ -241,7 +287,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 actix::System::current().stop();
             }
         });
-    });
+        Ok(())
+    })?;
     sys.run()?;
 
     Ok(())
