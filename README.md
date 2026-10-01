@@ -107,6 +107,37 @@ The DNS cache trades DNS-rebinding fidelity for latency: `getaddrinfo` does not
 expose record TTLs, so entries live for `--dns-cache-ttl` rather than the
 authoritative TTL, and only successful lookups are stored.
 
+## 📊 Observability
+
+Merino embeds a read-only HTTP service with real-time statistics — connected
+clients, DNS cache activity, traffic and error counters — served by the same
+binary. It is off by default:
+
+```bash
+# Serve the dashboard + JSON API on 127.0.0.1:9090
+merino --no-auth --stats-addr 127.0.0.1:9090
+```
+
+| Endpoint  | Purpose                                                    |
+| --------- | ---------------------------------------------------------- |
+| `GET /`   | Self-contained HTML dashboard (polling, no external assets) |
+| `GET /stats` | JSON snapshot: server, connections, DNS cache, traffic, errors |
+| `GET /clients` | Live per-connection rows (peer, state, command, bytes)    |
+| `GET /healthz` | Plain-text liveness check for load balancers             |
+
+`/stats` and `/clients` support `ETag` / `If-None-Match` conditional requests,
+so an idle dashboard costs nothing. When a loopback bind is not enough:
+
+```bash
+# Require a bearer token whenever the listener is exposed
+merino --no-auth --stats-addr 0.0.0.0:9090 --stats-token <TOKEN>
+```
+
+The statistics are collected with atomic counters and two `Mutex`-guarded map
+touches per connection; relayed byte counts are added once per relay, never per
+byte. See [`AGENTS/STATS_WEB_SERVICE_PLAN.md`](AGENTS/STATS_WEB_SERVICE_PLAN.md)
+for the design.
+
 # 🚥 Roadmap
 
 - [x] IPV6 Support

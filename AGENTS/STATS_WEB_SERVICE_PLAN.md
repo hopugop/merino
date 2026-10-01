@@ -15,6 +15,13 @@ counters, then real-time streaming and hardening.
 
 Each phase is independently committable and verifiable.
 
+> **Status: implemented.** All phases landed in one pass on
+> `feat/stats-web-service` (the plan was reviewed as a whole, then executed):
+> `--stats-addr` / `--stats-token`, the `/`, `/stats`, `/clients` and
+> `/healthz` endpoints, conditional GETs, the `stats` benchmarks, and CI-clean
+> tests/clippy. `serde_json` is the only new dependency; the "Open decisions"
+> section at the end records how each question was resolved.
+
 ## Constraints & conventions
 
 - Rust edition 2024 (toolchain pinned in `rust-toolchain.toml`); keep
@@ -28,8 +35,9 @@ Each phase is independently committable and verifiable.
 - Dependencies are deliberately minimal: `Cargo.toml` trims `tokio` to only
   what the proxy uses and the README advertises a standalone, dependency-light
   binary. Adding a web framework is a decision to be confirmed (see
-  ["Web server choice"](#web-server-choice)); the default plan adds **zero**
-  new dependencies.
+  ["Web server choice"](#web-server-choice)); the implemented listener adds
+  **zero** framework dependencies, with `serde_json = "1"` as the only new
+  crate (needed for machine-readable output whatever the HTTP layer).
 - Defaults must keep previous behaviour exactly: no stats socket, no counters
   visible in logs, no new listener, unless the operator opts in.
 - Both backends (`Merino` tokio loop and actix `SocksServer`) share
@@ -71,7 +79,7 @@ Each phase is independently committable and verifiable.
 
 ---
 
-## Phase 1 — Stats core (counters, no web)
+## Phase 1 — Stats core (counters, no web) — **done**
 
 **Goal.** Introduce a shared, always-on statistics core that the whole proxy
 updates cheaply, plus a serde-`Serialize` snapshot type the web layer will
@@ -126,7 +134,7 @@ cargo clippy --all-targets
 
 ---
 
-## Phase 2 — Instrument the hot paths
+## Phase 2 — Instrument the hot paths — **done**
 
 **Goal.** Wire every metric the dashboard should show: DNS cache activity,
 per-command request counts, bytes relayed, error counters.
@@ -182,7 +190,7 @@ cargo bench -- --quick   # sanity: counters on by default must not regress
 
 ---
 
-## Phase 3 — Embedded web server
+## Phase 3 — Embedded web server — **done**
 
 **Goal.** Serve the snapshot as JSON plus a self-contained HTML dashboard, over
 an HTTP listener that is off unless configured.
@@ -194,7 +202,7 @@ dependency set, the options are:
 
 | Option | Trade-off |
 | ------ | --------- |
-| **A. Hand-rolled minimal HTTP/1.1 on `tokio::net` (recommended)** | Zero new dependencies, matches the repo's hand-rolled protocol parsers and `#![forbid(unsafe_code)]` stance. The surface is read-only GETs with tiny payloads; ~250 lines. Needs hand-written request parsing (bounded reads, no indexing — the `take()` discipline transfers directly). |
+| **A. Hand-rolled minimal HTTP/1.1 on `tokio::net` (implemented)** | Zero framework dependencies, matches the repo's hand-rolled protocol parsers and `#![forbid(unsafe_code)]` stance. The surface is read-only GETs with tiny payloads; ~350 lines. Needs hand-written request parsing (bounded reads, no indexing — the `take()` discipline transfers directly). `serde_json` covers the JSON output. |
 | B. `actix-web` | Full-featured, integrates with the existing actix system, but a large dependency tree that pulls in its own runtime/feature surface, against the minimal-dependency convention. |
 | C. `axum` + `hyper` | Popular and small-ish, but needs additional `tokio` features (`fs` isn't needed) and still adds a dependency subtree. |
 
@@ -272,7 +280,7 @@ cargo run -- --no-auth --ip 127.0.0.1 --port 1080 --stats-addr 127.0.0.1:9090
 
 ---
 
-## Phase 4 — Real-time detail, hardening, docs
+## Phase 4 — Real-time detail, hardening, docs — **done**
 
 **Goal.** Per-connection detail, fresher-than-polling updates, security audit,
 and complete documentation so the feature is shippable and maintained.
@@ -353,14 +361,23 @@ cargo bench
 - Keep `Snapshot` fields additive-only after release (add fields, never rename)
   so the machine interface stays stable for dashboards.
 
-## Open decisions to confirm
+## Decisions taken (implementation)
 
-1. **Web server choice** — Option A (hand-rolled, zero deps, recommended) vs B
-   (`actix-web`) vs C (`axum`).
-2. **Always-on counters** — recommended yes (negligible, keeps tests uniform);
-   a `no-stats` feature is possible but forks every increment site.
-3. **Real-time mechanism** — 1 s polling + conditional GET (recommended) vs
-   hand-rolled SSE.
-4. **Client detail endpoint** — include `GET /clients` (recommended, opt-in via
-   token) or keep the dashboard to aggregates only.
-5. **Token auth scheme** — `Bearer` header (recommended) vs `?token=` query.
+1. **Web server choice** — Option A: hand-rolled HTTP/1.1 on `tokio::net`
+   (`src/stats/http.rs`), with `serde_json` added for JSON output. No `actix`
+   dependency growth.
+2. **Always-on counters** — yes. Atomics plus two `Mutex`-guarded map touches
+   per connection; relayed bytes are added once per `copy_bidirectional`
+   result, never per byte. The `stats` benchmark group in `benches/parse.rs`
+   measures the begin/drop and snapshot costs.
+3. **Real-time mechanism** — 1 s polling of the dashboard with `ETag` /
+   `If-None-Match` conditional GETs (consumers get `304` while nothing
+   changed). No SSE/WebSockets.
+4. **Client detail endpoint** — `GET /clients` included, backed by the live
+   per-connection registry (bounded by `max_connections`).
+5. **Token auth scheme** — `Authorization: Bearer <token>` header, compared
+   constant-time; a non-loopback bind without `--stats-token` logs a warning.
+
+All implementation code is additive and gated: with `--stats-addr` unset no
+socket is bound, counters are invisible, and every change is independently
+revertible at the commit level.
