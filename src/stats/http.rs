@@ -296,43 +296,126 @@ async fn respond(
     stream.shutdown().await
 }
 
-/// Dependency-free dashboard. It polls `/stats` and `/clients` once a second
-/// and renders values as text only, so nothing the proxy relays can inject
-/// markup. All assets are inline; no external network requests are made.
+/// Dashboard served from `/`. It polls `/stats` and `/clients` once a second
+/// and renders every value as text, so nothing the proxy relays can inject
+/// markup. All logic is inline; the only external fetches are the optional
+/// Google Fonts below, which are cosmetic and safe to block (the page falls
+/// back to the system stack and renders identically without them).
 const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>merino live dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap">
 <style>
-:root { color-scheme: dark; --accent: #4fc3f7; }
+:root {
+  color-scheme: dark;
+  --bg: #0b0d12;
+  --bg-glow-a: rgba(79, 195, 247, .10);
+  --bg-glow-b: rgba(126, 87, 194, .10);
+  --card: rgba(22, 26, 34, .82);
+  --card-border: rgba(120, 138, 160, .14);
+  --card-border-strong: rgba(120, 138, 160, .22);
+  --text: #e6eaf1;
+  --muted: #8b95a7;
+  --faint: #5b6577;
+  --accent: #4fc3f7;
+  --accent-dim: rgba(79, 195, 247, .14);
+  --ok: #35d07f;
+  --bad: #ff5c6c;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
 * { box-sizing: border-box; }
-body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 20px; background: #0f1115; color: #dfe3ea; }
-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-h1 { font-size: 20px; margin: 0; }
-.dot { width: 10px; height: 10px; border-radius: 50%; background: #2e7d32; animation: pulse 2s infinite; }
-.dot.off { background: #b71c1c; animation: none; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-.sub { color: #8a93a3; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
-.card { background: #161a21; border: 1px solid #242b36; border-radius: 10px; padding: 14px 16px; }
-.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: #7d8797; margin: 0 0 10px; }
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; margin: 0; }
-.kv dt { color: #8a93a3; }
-.kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #1f2630; }
-th { color: #8a93a3; font-weight: 500; }
-.empty { color: #6b7280; font-style: italic; }
+html { scrollbar-color: #2a323f transparent; }
+body {
+  margin: 0;
+  padding: 28px clamp(16px, 3vw, 40px) 48px;
+  min-height: 100vh;
+  font: 14px/1.55 var(--sans);
+  color: var(--text);
+  background:
+    radial-gradient(1100px 600px at 12% -8%, var(--bg-glow-a), transparent 60%),
+    radial-gradient(900px 520px at 100% 0%, var(--bg-glow-b), transparent 55%),
+    var(--bg);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 0 0 22px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.mark {
+  display: grid; place-items: center;
+  width: 34px; height: 34px; border-radius: 10px;
+  background: linear-gradient(145deg, var(--accent-dim), rgba(126, 87, 194, .18));
+  border: 1px solid var(--card-border-strong);
+  font-size: 17px;
+}
+h1 { font-size: 19px; font-weight: 600; letter-spacing: -.01em; margin: 0; }
+h1 .thin { color: var(--muted); font-weight: 400; }
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(53, 208, 127, .55);
+  animation: pulse 2.2s ease-out infinite;
+}
+.dot.off { background: var(--bad); box-shadow: 0 0 0 0 rgba(255, 92, 108, .5); animation: none; }
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(53, 208, 127, .5); }
+  70% { box-shadow: 0 0 0 7px rgba(53, 208, 127, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(53, 208, 127, 0); }
+}
+.sub { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.sub .sep { color: var(--faint); padding: 0 7px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; align-items: start; }
+.card { min-height: 172px; }
+.card.wide { grid-column: 1 / -1; min-height: 0; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  padding: 16px 18px;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .03) inset, 0 12px 30px -22px rgba(0, 0, 0, .9);
+}
+.card h2 {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .13em;
+  color: var(--muted); margin: 0 0 12px;
+}
+.card h2::before {
+  content: ""; width: 3px; height: 11px; border-radius: 2px;
+  background: var(--accent); opacity: .75;
+}
+.kv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 16px; margin: 0; }
+.kv dt { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kv dd {
+  margin: 0; text-align: right; white-space: nowrap;
+  font-family: var(--mono); font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(120, 138, 160, .10); }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: rgba(120, 138, 160, .06); }
+td { font-family: var(--mono); font-variant-numeric: tabular-nums; color: #cfd6e2; }
+.empty { color: var(--faint); font-style: italic; font-family: var(--sans); }
 canvas { width: 100%; height: 64px; display: block; }
-.spark-meta { display: flex; justify-content: space-between; color: #8a93a3; font-size: 12px; margin-top: 6px; }
+.spark-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 8px; font-family: var(--mono); }
+.table-wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
 <header>
-  <span id="dot" class="dot"></span>
-  <h1>&#128225; merino &mdash; live dashboard</h1>
+  <div class="brand">
+    <span class="dot" id="dot"></span>
+    <span class="mark">&#128225;</span>
+    <h1>merino <span class="thin">live dashboard</span></h1>
+  </div>
   <div class="sub" id="meta">connecting&hellip;</div>
 </header>
 <div class="grid">
@@ -342,9 +425,9 @@ canvas { width: 100%; height: 64px; display: block; }
   <div class="card"><h2>Traffic</h2><dl class="kv" id="traffic"></dl></div>
   <div class="card"><h2>Active connections</h2><canvas id="spark" width="600" height="64"></canvas><div class="spark-meta"><span id="spark-min">min 0</span><span id="spark-max">max 0</span></div></div>
   <div class="card"><h2>Errors</h2><dl class="kv" id="errors"></dl></div>
-  <div class="card"><h2>Active per IP</h2><table id="per-ip"><tbody></tbody></table></div>
-  <div class="card"><h2>Cached names</h2><table id="names"><tbody></tbody></table></div>
-  <div class="card" style="grid-column: 1 / -1;"><h2>Clients</h2><table id="clients"><tbody></tbody></table></div>
+  <div class="card"><h2>Active per IP</h2><div class="table-wrap"><table id="per-ip"><tbody></tbody></table></div></div>
+  <div class="card"><h2>Cached names</h2><div class="table-wrap"><table id="names"><tbody></tbody></table></div></div>
+  <div class="card wide"><h2>Clients</h2><div class="table-wrap"><table id="clients"><tbody></tbody></table></div></div>
 </div>
 <script>
 "use strict";
@@ -471,12 +554,12 @@ async function tick() {
 
   document.getElementById("meta").textContent =
     "uptime " + fmtUptime(s.server.uptime_secs) +
-    " \u00b7 updated " + delta + "s ago" +
-    " \u00b7 v" + s.server.version;
+    "  \u00b7  updated " + delta + "s ago" +
+    "  \u00b7  v" + s.server.version;
 
   setKV("server", [
     ["listeners", s.server.listeners.join(", ") || "—"],
-    ["started", new Date(s.server.started_at_unix * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC"],
+    ["started", new Date(s.server.started_at_unix * 1000).toISOString().slice(0, 19).replace("T", " ") + "Z"],
   ]);
   setKV("connections", [
     ["active", s.connections.active],
