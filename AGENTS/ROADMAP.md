@@ -24,6 +24,7 @@ Current state (from `README.md` and `src/lib.rs`):
 - `[x]` `UDP ASSOCIATE`
 - `[x]` Benchmarks & unit tests
 - `[x]` Actix-based backend
+- `[x]` Embedded stats web service (item 9)
 - `[ ]` `SOCKS4` / `SOCKS4a` support
 
 ---
@@ -278,6 +279,40 @@ removed.
 
 **Depends on.** None, though a shared connection state machine (actix) reduces
 duplication.
+
+---
+
+## 9. Embedded stats web service
+
+**Status: complete.** Implemented across the phases in
+[`STATS_WEB_SERVICE_PLAN.md`](STATS_WEB_SERVICE_PLAN.md), in one landing after
+the plan was agreed: `src/stats.rs` (always-on counters + snapshot),
+`src/stats/http.rs` (dependency-free HTTP listener), CLI flags
+`--stats-addr` / `--stats-token`, the `/`, `/stats`, `/clients` and
+`/healthz` endpoints, and coverage in `tests/stats.rs` plus the
+`stats` benchmarks.
+
+**Goal.** Expose real-time proxy statistics — connected clients, DNS cache
+activity, traffic and error counters — over an embedded, opt-in HTTP service.
+
+**Design decisions taken (from the plan's open questions).**
+- Hand-rolled HTTP/1.1 on `tokio::net` (zero framework dependencies);
+  `serde_json` was added for the machine-readable output.
+- Counters are always on (negligible cost, uniform tests); only the listener
+  is opt-in.
+- Real-time via 1 s polling of the dashboard plus `ETag`/`If-None-Match`
+  conditional GETs — no SSE/WebSockets needed.
+- `/clients` detail endpoint included; `Bearer` token auth via header.
+
+**Acceptance criteria.**
+- `--stats-addr` unset changes nothing (no socket, previous behaviour).
+- `--stats-addr 127.0.0.1:9090` serves the dashboard and JSON snapshots that
+  reflect live relays and DNS cache hits/inserts.
+- Non-loopback binds without `--stats-token` log a warning; tokenless requests
+  get `401`.
+- `cargo test`, `cargo clippy --all-targets` and `cargo bench` are green.
+
+**Effort.** Medium–large (three phases plus hardening/docs).
 
 ---
 

@@ -9,8 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    DEFAULT_MAX_CONNECTIONS, DnsCache, IpSlot, PerIpLimiter, SOCKClient, ServerContext, User,
-    accept_loop, bind_all, run_client,
+    DEFAULT_MAX_CONNECTIONS, DnsCache, IpSlot, PerIpLimiter, SOCKClient, ServerContext, Stats,
+    User, accept_loop, bind_all, run_client,
 };
 
 /// One actor per accepted TCP connection.
@@ -26,6 +26,8 @@ pub struct SocksConnection {
     /// Held for the same reason, so the source IP's per-IP slot is freed when
     /// the actor stops.
     _ip_slot: Option<IpSlot>,
+    /// Shared always-on statistics; registered in `run_client` via the guard.
+    stats: Arc<Stats>,
 }
 
 impl SocksConnection {
@@ -35,6 +37,7 @@ impl SocksConnection {
             peer,
             _permit: None,
             _ip_slot: None,
+            stats: Arc::new(Stats::new()),
         }
     }
 
@@ -46,6 +49,11 @@ impl SocksConnection {
     /// Attach the per-IP slot acquired by the server.
     pub(crate) fn set_ip_slot(&mut self, slot: Option<IpSlot>) {
         self._ip_slot = slot;
+    }
+
+    /// Share the server's always-on statistics with this connection.
+    pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = stats;
     }
 }
 
@@ -61,8 +69,9 @@ impl Actor for SocksConnection {
             }
         };
         let peer = self.peer;
+        let stats = self.stats.clone();
         ctx.spawn(
-            fut::wrap_future::<_, SocksConnection>(run_client(client, peer))
+            fut::wrap_future::<_, SocksConnection>(run_client(client, peer, stats))
                 .map(|_, _, ctx: &mut Context<SocksConnection>| ctx.stop()),
         );
     }
@@ -84,6 +93,8 @@ pub struct SocksServer {
     dns_cache: Option<Arc<DnsCache>>,
     /// Optional per-source connection cap; off by default.
     per_ip: Option<Arc<PerIpLimiter>>,
+    /// Always-on statistics shared with the web service and each connection.
+    stats: Arc<Stats>,
 }
 
 impl SocksServer {
@@ -110,7 +121,17 @@ impl SocksServer {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             dns_cache: None,
             per_ip: None,
+            stats: Arc::new(Stats::new()),
         })
+    }
+
+    /// Share `stats` with the server and every connection it accepts.
+    ///
+    /// The default is a private instance; sharing lets the embedded web
+    /// service serve the same counters (see `--stats-addr`). Call before
+    /// [`Actor::start`].
+    pub fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = stats;
     }
 
     /// Set the maximum number of simultaneous client connections.
@@ -127,7 +148,9 @@ impl SocksServer {
     /// default, positive answers only, bounded by `max_entries` and reused for
     /// `ttl`. Call before [`Actor::start`].
     pub fn set_dns_cache(&mut self, ttl: Duration, max_entries: usize) {
-        self.dns_cache = Some(Arc::new(DnsCache::new(ttl, max_entries)));
+        let cache = Arc::new(DnsCache::new(ttl, max_entries));
+        self.stats.register_dns(Arc::clone(&cache));
+        self.dns_cache = Some(cache);
     }
 
     /// Cap how many simultaneous connections a single source IP may hold.
@@ -161,20 +184,24 @@ impl Actor for SocksServer {
             timeout: self.timeout,
             dns_cache: self.dns_cache.clone(),
             per_ip: self.per_ip.clone(),
+            stats: self.stats.clone(),
         };
 
         for listener in std::mem::take(&mut self.listeners) {
             let semaphore = semaphore.clone();
             let server_ctx = server_ctx.clone();
+            let conn_stats = server_ctx.stats.clone();
             ctx.spawn(fut::wrap_future::<_, SocksServer>(accept_loop(
                 listener,
                 semaphore,
                 server_ctx,
-                |client, peer, permit, ip_slot| {
+                move |client, peer, permit, ip_slot| {
+                    let conn_stats = conn_stats.clone();
                     SocksConnection::create(move |_| {
                         let mut connection = SocksConnection::new(client, peer);
                         connection.set_permit(permit);
                         connection.set_ip_slot(ip_slot);
+                        connection.set_stats(conn_stats);
                         connection
                     });
                 },

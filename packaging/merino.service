@@ -17,6 +17,10 @@ ExecStart=%h/.cargo/bin/merino --no-auth --ip 127.0.0.1 --port 1080
 # active, so comment the line above before enabling this one:
 # ExecStart=%h/.cargo/bin/merino --users %h/.config/merino/users.csv --ip 127.0.0.1 --port 1080
 
+# Optional: expose real-time statistics over loopback HTTP (dashboard + JSON).
+# Add --stats-addr 127.0.0.1:9090 to the active ExecStart line above. For a
+# remote bind, also pass --stats-token <TOKEN>. Stats are off by default.
+
 Environment=RUST_LOG=merino=info
 Restart=on-failure
 RestartSec=2s

@@ -74,6 +74,24 @@ async fn greet_noauth(addr: SocketAddr) {
     assert_eq!(resp, [0x05, 0x00]);
 }
 
+/// Connect to `addr`, retrying until it accepts.
+///
+/// The stats listener binds *after* the SOCKS one inside main, so a test that
+/// sees the SOCKS "Listening on" line may still hit a not-yet-bound stats
+/// port; retrying removes that startup race.
+async fn connect_with_retry(addr: SocketAddr) -> tokio::net::TcpStream {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("connect to {addr} failed: {e}"),
+        }
+    }
+}
+
 /// Ask a running server to stop via a signal and assert it exits cleanly.
 async fn stop_with(child: &mut Child, signal: &str) {
     let pid = child
@@ -267,4 +285,90 @@ async fn quiet_flag_suppresses_logs() {
     let mut text = String::new();
     stderr.read_to_string(&mut text).await.unwrap();
     assert!(!text.contains("Listening"), "quiet mode logged: {text}");
+}
+
+#[tokio::test]
+async fn stats_web_service_flag_serves_json() {
+    // Reserve a loopback port, then free it so the child can bind it. The
+    // ephemeral pool is shared by other tests; a short window exists, matching
+    // how `busy_port_exits_with_error` already exercises ports.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stats_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut child = spawn(
+        &[
+            "--port",
+            "0",
+            "--no-auth",
+            "--stats-addr",
+            &format!("127.0.0.1:{stats_port}"),
+        ],
+        None,
+    );
+    wait_until_listening(&mut child).await;
+
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
+    stream
+        .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+    assert!(
+        response.contains("\"connections\"") && response.contains("\"traffic\""),
+        "expected the stats snapshot, got: {response}"
+    );
+
+    terminate(&mut child).await;
+}
+
+#[tokio::test]
+async fn stats_web_service_requires_the_configured_token() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stats_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut child = spawn(
+        &[
+            "--port",
+            "0",
+            "--no-auth",
+            "--stats-addr",
+            &format!("127.0.0.1:{stats_port}"),
+            "--stats-token",
+            "s3cret",
+        ],
+        None,
+    );
+    wait_until_listening(&mut child).await;
+
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
+    stream
+        .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut denied = String::new();
+    stream.read_to_string(&mut denied).await.unwrap();
+    assert!(
+        denied.starts_with("HTTP/1.1 401"),
+        "tokenless request must be refused, got: {denied}"
+    );
+
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
+    stream
+        .write_all(
+            b"GET /stats HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut allowed = String::new();
+    stream.read_to_string(&mut allowed).await.unwrap();
+    assert!(
+        allowed.starts_with("HTTP/1.1 200"),
+        "token request must succeed, got: {allowed}"
+    );
+
+    terminate(&mut child).await;
 }

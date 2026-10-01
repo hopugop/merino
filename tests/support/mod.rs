@@ -2,6 +2,7 @@
 
 use merino::*;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -13,6 +14,7 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Server {
     pub addr: SocketAddr,
     pub handle: JoinHandle<()>,
+    pub stats: Arc<Stats>,
 }
 
 impl Drop for Server {
@@ -25,11 +27,17 @@ pub async fn start_merino(auth_methods: Vec<u8>, users: Vec<User>) -> Server {
     let mut merino = Merino::new(0, "127.0.0.1", auth_methods, users, None)
         .await
         .expect("failed to bind Merino");
+    let stats = Arc::new(Stats::new());
+    merino.set_stats(stats.clone());
     let addr = merino.local_addr().expect("failed to read local addr");
     let handle = tokio::spawn(async move {
         merino.serve().await;
     });
-    Server { addr, handle }
+    Server {
+        addr,
+        handle,
+        stats,
+    }
 }
 
 pub async fn start_no_auth() -> Server {

@@ -173,10 +173,42 @@ fn bench_dns_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of the always-on connection accounting and of building a snapshot —
+/// the two operations the stats web service adds. The relay itself already
+/// runs with these counters enabled (see [`proxy.rs`](proxy.rs)), so this
+/// isolates the per-connection and read-path costs.
+fn bench_stats_core(c: &mut Criterion) {
+    let stats = std::sync::Arc::new(Stats::new());
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    let mut group = c.benchmark_group("stats");
+    group.bench_function("begin_client_drop", |b| {
+        b.iter(|| {
+            let guard = stats.begin_client(peer, None);
+            drop(guard);
+        });
+    });
+    group.bench_function("active_guard_with_registry", |b| {
+        b.iter(|| {
+            let guard = stats.begin_client(peer, None);
+            stats.note_request(Some(guard.id()), SockCommand::Connect);
+            let counters = guard.relay_counters();
+            counters.0.store(8192, std::sync::atomic::Ordering::Relaxed);
+            counters.1.store(8192, std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
+        });
+    });
+    group.bench_function("snapshot", |b| {
+        b.iter(|| black_box(stats.snapshot()));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parsers,
     bench_userpass_lookup,
-    bench_dns_lookup
+    bench_dns_lookup,
+    bench_stats_core
 );
 criterion_main!(benches);
