@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -320,6 +321,47 @@ async fn stats_web_service_flag_serves_json() {
         response.contains("\"connections\"") && response.contains("\"traffic\""),
         "expected the stats snapshot, got: {response}"
     );
+
+    terminate(&mut child).await;
+}
+
+#[tokio::test]
+async fn stats_web_service_accepts_a_hostname_bind_addr() {
+    // The deploy unit passes a Tailscale DNS name to --stats-addr; make sure a
+    // hostname is resolved and bound instead of rejected like an IP-only parse
+    // would. `localhost` keeps the test hermetic (no external DNS).
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stats_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // Pick the same first-resolved address the child will bind, so the
+    // connect below matches whether localhost resolves v4- or v6-first.
+    let bind_addr = format!("localhost:{stats_port}")
+        .to_socket_addrs()
+        .unwrap()
+        .next()
+        .unwrap();
+
+    let mut child = spawn(
+        &[
+            "--port",
+            "0",
+            "--no-auth",
+            "--stats-addr",
+            &format!("localhost:{stats_port}"),
+        ],
+        None,
+    );
+    wait_until_listening(&mut child).await;
+
+    let mut stream = connect_with_retry(bind_addr).await;
+    stream
+        .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
     terminate(&mut child).await;
 }

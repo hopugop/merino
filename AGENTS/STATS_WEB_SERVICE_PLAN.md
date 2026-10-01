@@ -218,8 +218,10 @@ This should be confirmed in review before phase 3 starts.
 - `Cargo.toml` — only if Option B/C is chosen.
 
 **Flags (all default off).**
-- `--stats-addr <IP:PORT>` — enable the listener. Unset → no socket (default
-  behaviour unchanged).
+- `--stats-addr <ADDR:PORT>` — enable the listener. `ADDR` may be an IP
+  literal (`127.0.0.1`, `0.0.0.0`, `[::1]`) **or a hostname** (e.g. a Tailscale
+  DNS name); hostnames are resolved once at startup, mirroring `--ip`. Unset →
+  no socket (default behaviour unchanged).
 - `--stats-token <TOKEN>` — require `Authorization: Bearer <TOKEN>` on every
   request; recommended whenever `--stats-addr` binds anything but loopback.
 
@@ -241,8 +243,9 @@ This should be confirmed in review before phase 3 starts.
   `packaging/merino.service` health checks.
 
 **Web server hardening (Phase 3 baseline).**
-- Binds **loopback by default**: `--stats-addr` is an explicit `IP:PORT`, and
-  binding a non-loopback address without `--stats-token` logs a warning.
+- Binds **loopback by default**: `--stats-addr` is an explicit `ADDR:PORT` (IP
+  literal or hostname), and binding a non-loopback address without
+  `--stats-token` logs a warning.
 - Bounded request parsing: cap the request line + headers at 8 KiB total, 400
   on anything malformed, one fixed-size read buffer, no allocation per request.
 - Idle/read timeout on stats sockets (e.g. 30 s) so the stats listener is not a

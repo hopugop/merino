@@ -308,6 +308,8 @@ activity, traffic and error counters — over an embedded, opt-in HTTP service.
 - `--stats-addr` unset changes nothing (no socket, previous behaviour).
 - `--stats-addr 127.0.0.1:9090` serves the dashboard and JSON snapshots that
   reflect live relays and DNS cache hits/inserts.
+- `--stats-addr <hostname>:9090` (e.g. a Tailscale DNS name) resolves and binds
+  like `--ip` does, so each node can advertise its own tailnet address.
 - Non-loopback binds without `--stats-token` log a warning; tokenless requests
   get `401`.
 - `cargo test`, `cargo clippy --all-targets` and `cargo bench` are green.

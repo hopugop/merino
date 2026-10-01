@@ -16,6 +16,7 @@ use merino::*;
 use std::env;
 use std::error::Error;
 use std::io;
+use std::net::ToSocketAddrs;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,8 +82,9 @@ struct Opt {
     dns_cache_entries: usize,
 
     /// Serve real-time statistics over HTTP (off by default).
-    /// Example: 127.0.0.1:9090. Endpoints: /, /stats, /clients, /healthz.
-    #[arg(long, value_name = "IP:PORT")]
+    /// Example: 127.0.0.1:9090. A hostname (e.g. a Tailscale DNS name) is
+    /// resolved once at startup, like --ip. Endpoints: /, /stats, /clients, /healthz.
+    #[arg(long, value_name = "ADDR:PORT")]
     stats_addr: Option<String>,
 
     /// Require this bearer token on every statistics request.
@@ -170,6 +172,24 @@ fn load_users(users_file: &Path, allow_insecure: bool) -> Result<Vec<User>, Box<
     Ok(users)
 }
 
+/// Resolve a `--stats-addr` value into the address to bind.
+///
+/// Accepts an IP literal (`127.0.0.1:9090`, `[::1]:9090`) or a hostname
+/// (e.g. a Tailscale DNS name such as `host.ts.net:9090`), mirroring how
+/// `--ip` may name the bind address. A hostname is resolved once at startup;
+/// the first resolved address is used.
+fn resolve_stats_addr(addr: &str) -> Result<std::net::SocketAddr, Box<dyn Error>> {
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {addr}"),
+            )
+        })
+        .map_err(Into::into)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", LOGO);
 
@@ -231,10 +251,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     server.set_max_connections_per_ip(opt.max_connections_per_ip);
 
     // Statistics are always collected; only the HTTP listener is opt-in.
+    // The addr may be an IP literal or a hostname; hostnames are resolved to
+    // an address here so the listener uses a plain SocketAddr below.
     let stats_addr: Option<std::net::SocketAddr> = opt
         .stats_addr
         .as_deref()
-        .map(|addr| addr.parse())
+        .map(resolve_stats_addr)
         .transpose()?;
     let stats = Arc::new(merino::Stats::new());
     stats.note_listeners(server.local_addrs());
@@ -454,5 +476,31 @@ mod tests {
         let path = write_temp_csv("empty", "username,password\n", 0o600);
         assert!(load_users(&path, false).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_stats_addr_accepts_ip_literal() {
+        assert_eq!(
+            resolve_stats_addr("127.0.0.1:9090").unwrap(),
+            "127.0.0.1:9090".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_stats_addr("[::1]:9090").unwrap(),
+            "[::1]:9090".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_stats_addr_resolves_a_hostname() {
+        // localhost resolves to a loopback address on every supported host.
+        let addr = resolve_stats_addr("localhost:9090").unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 9090);
+    }
+
+    #[test]
+    fn resolve_stats_addr_rejects_garbage() {
+        assert!(resolve_stats_addr("no-port-here").is_err());
+        assert!(resolve_stats_addr(":notaport").is_err());
     }
 }

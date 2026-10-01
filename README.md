@@ -118,6 +118,14 @@ binary. It is off by default:
 merino --no-auth --stats-addr 127.0.0.1:9090
 ```
 
+`--stats-addr` accepts an IP literal or a hostname (resolved once at startup),
+so a Tailscale DNS name works too:
+
+```bash
+# Serve on every address this node's tailscale name resolves to
+merino --no-auth --stats-addr ${TAILSCALE_HOSTNAME}:9090
+```
+
 | Endpoint  | Purpose                                                    |
 | --------- | ---------------------------------------------------------- |
 | `GET /`   | Self-contained HTML dashboard (polling, no external assets) |
