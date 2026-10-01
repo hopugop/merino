@@ -74,6 +74,24 @@ async fn greet_noauth(addr: SocketAddr) {
     assert_eq!(resp, [0x05, 0x00]);
 }
 
+/// Connect to `addr`, retrying until it accepts.
+///
+/// The stats listener binds *after* the SOCKS one inside main, so a test that
+/// sees the SOCKS "Listening on" line may still hit a not-yet-bound stats
+/// port; retrying removes that startup race.
+async fn connect_with_retry(addr: SocketAddr) -> tokio::net::TcpStream {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("connect to {addr} failed: {e}"),
+        }
+    }
+}
+
 /// Ask a running server to stop via a signal and assert it exits cleanly.
 async fn stop_with(child: &mut Child, signal: &str) {
     let pid = child
@@ -290,13 +308,7 @@ async fn stats_web_service_flag_serves_json() {
     );
     wait_until_listening(&mut child).await;
 
-    let mut stream = timeout(
-        START_TIMEOUT,
-        tokio::net::TcpStream::connect(("127.0.0.1", stats_port)),
-    )
-    .await
-    .expect("stats connect timed out")
-    .expect("stats connect failed");
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
     stream
         .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
@@ -332,13 +344,7 @@ async fn stats_web_service_requires_the_configured_token() {
     );
     wait_until_listening(&mut child).await;
 
-    let mut stream = timeout(
-        START_TIMEOUT,
-        tokio::net::TcpStream::connect(("127.0.0.1", stats_port)),
-    )
-    .await
-    .expect("stats connect timed out")
-    .expect("stats connect failed");
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
     stream
         .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
@@ -350,13 +356,7 @@ async fn stats_web_service_requires_the_configured_token() {
         "tokenless request must be refused, got: {denied}"
     );
 
-    let mut stream = timeout(
-        START_TIMEOUT,
-        tokio::net::TcpStream::connect(("127.0.0.1", stats_port)),
-    )
-    .await
-    .expect("stats connect timed out")
-    .expect("stats connect failed");
+    let mut stream = connect_with_retry(SocketAddr::from(([127, 0, 0, 1], stats_port))).await;
     stream
         .write_all(
             b"GET /stats HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cret\r\n\r\n",
