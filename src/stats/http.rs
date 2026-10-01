@@ -298,154 +298,210 @@ async fn respond(
 
 /// Dependency-free dashboard. It polls `/stats` and `/clients` once a second
 /// and renders values as text only, so nothing the proxy relays can inject
-/// markup.
+/// markup. All assets are inline; no external network requests are made.
 const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>merino stats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>merino live dashboard</title>
 <style>
 :root { color-scheme: dark; }
-body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; background: #111; color: #ddd; }
-h1 { font-size: 20px; margin: 0 0 4px; }
-.sub { color: #888; margin-bottom: 20px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-.card { background: #1b1b1f; border: 1px solid #2c2c33; border-radius: 8px; padding: 14px 16px; }
-.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #9a9aa5; margin: 0 0 10px; }
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
-.kv dt { color: #9a9aa5; }
+* { box-sizing: border-box; }
+body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 20px; background: #0f1115; color: #dfe3ea; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #2e7d32; animation: pulse 2s infinite; }
+.dot.off { background: #b71c1c; animation: none; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.sub { color: #8a93a3; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.card { background: #161a21; border: 1px solid #242b36; border-radius: 10px; padding: 14px 16px; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: #7d8797; margin: 0 0 10px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; margin: 0; }
+.kv dt { color: #8a93a3; }
 .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #25252b; }
-th { color: #9a9aa5; font-weight: 500; }
-.empty { color: #777; font-style: italic; }
+th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #1f2630; }
+th { color: #8a93a3; font-weight: 500; }
+.empty { color: #6b7280; font-style: italic; }
+canvas { width: 100%; height: 64px; display: block; }
 </style>
 </head>
 <body>
-<h1>&#128225; merino &mdash; live stats</h1>
-<div class="sub">refreshes every second</div>
+<header>
+  <span id="dot" class="dot"></span>
+  <h1>&#128225; merino &mdash; live dashboard</h1>
+  <div class="sub" id="meta">connecting&#8230;</div>
+</header>
 <div class="grid">
-  <div class="card">
-    <h2>Server</h2>
-    <dl class="kv" id="server"></dl>
-  </div>
-  <div class="card">
-    <h2>Connections</h2>
-    <dl class="kv" id="connections"></dl>
-  </div>
-  <div class="card">
-    <h2>DNS cache</h2>
-    <dl class="kv" id="dns"></dl>
-  </div>
-  <div class="card">
-    <h2>Traffic</h2>
-    <dl class="kv" id="traffic"></dl>
-  </div>
-  <div class="card">
-    <h2>Errors</h2>
-    <dl class="kv" id="errors"></dl>
-  </div>
-  <div class="card">
-    <h2>Active per IP</h2>
-    <table id="per-ip"><tbody></tbody></table>
-  </div>
-  <div class="card">
-    <h2>Cached names</h2>
-    <table id="names"><tbody></tbody></table>
-  </div>
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>Clients</h2>
-    <table id="clients"><tbody></tbody></table>
-  </div>
+  <div class="card"><h2>Server</h2><dl class="kv" id="server"></dl></div>
+  <div class="card"><h2>Connections</h2><dl class="kv" id="connections"></dl></div>
+  <div class="card"><h2>DNS cache</h2><dl class="kv" id="dns"></dl></div>
+  <div class="card"><h2>Traffic</h2><dl class="kv" id="traffic"></dl></div>
+  <div class="card"><h2>Active connections</h2><canvas id="spark" width="600" height="64"></canvas></div>
+  <div class="card"><h2>Errors</h2><dl class="kv" id="errors"></dl></div>
+  <div class="card"><h2>Active per IP</h2><table id="per-ip"><tbody></tbody></table></div>
+  <div class="card"><h2>Cached names</h2><table id="names"><tbody></tbody></table></div>
+  <div class="card" style="grid-column: 1 / -1;"><h2>Clients</h2><table id="clients"><tbody></tbody></table></div>
 </div>
 <script>
-function fmt(n, d = 0) {
-  const units = ["", "k", "M", "G", "T"];
-  let i = 0;
+"use strict";
+var SPARK_LEN = 60;
+var activeHistory = new Array(SPARK_LEN).fill(0);
+var last = { up: 0, down: 0, t: 0 };
+
+function fmtBytes(n) {
+  var units = ["B", "kB", "MB", "GB", "TB"];
+  var i = 0;
   while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
-  return n.toFixed(i === 0 ? d : 1) + units[i];
+  return (i === 0 ? String(n) : n.toFixed(1)) + " " + units[i];
+}
+function fmtRate(bps) {
+  if (bps < 1) { return "0 B/s"; }
+  return fmtBytes(bps) + "/s";
+}
+function fmtUptime(s) {
+  var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+      m = Math.floor((s % 3600) / 60), sec = s % 60;
+  var parts = [];
+  if (d) { parts.push(d + "d"); }
+  if (h) { parts.push(h + "h"); }
+  if (m) { parts.push(m + "m"); }
+  parts.push(sec + "s");
+  return parts.join(" ");
 }
 function setKV(id, pairs) {
-  const dl = document.getElementById(id);
+  var dl = document.getElementById(id);
   dl.textContent = "";
-  for (const [k, v] of pairs) {
-    const dt = document.createElement("dt"); dt.textContent = k + ":";
-    const dd = document.createElement("dd"); dd.textContent = String(v);
+  for (var i = 0; i < pairs.length; i++) {
+    var dt = document.createElement("dt"); dt.textContent = pairs[i][0] + ":";
+    var dd = document.createElement("dd"); dd.textContent = String(pairs[i][1]);
     dl.append(dt, dd);
   }
 }
-function setRows(id, headers, rows) {
-  const tbody = document.querySelector("#" + id + " tbody");
+function setRows(id, cols, rows) {
+  var tbody = document.querySelector("#" + id + " tbody");
   tbody.textContent = "";
   if (!rows.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
+    var tr = document.createElement("tr");
+    var td = document.createElement("td");
     td.className = "empty";
-    td.colSpan = headers.length;
+    td.colSpan = cols;
     td.textContent = "none";
     tr.append(td); tbody.append(tr);
     return;
   }
-  for (const row of rows) {
-    const tr = document.createElement("tr");
-    for (const cell of row) {
-      const td = document.createElement("td");
-      td.textContent = String(cell);
-      tr.append(td);
+  for (var r = 0; r < rows.length; r++) {
+    var rowTr = document.createElement("tr");
+    for (var cIdx = 0; cIdx < rows[r].length; cIdx++) {
+      var cellTd = document.createElement("td");
+      cellTd.textContent = String(rows[r][cIdx]);
+      rowTr.append(cellTd);
     }
-    tbody.append(tr);
+    tbody.append(rowTr);
   }
 }
-async function tick() {
-  try {
-    const res = await fetch("/stats", { cache: "no-store" });
-    const s = await res.json();
-    setKV("server", [
-      ["version", s.server.version],
-      ["uptime", fmt(s.server.uptime_secs) + "s"],
-      ["listeners", s.server.listeners.join(", ") || "—"],
-    ]);
-    setKV("connections", [
-      ["active", s.connections.active],
-      ["accepted total", s.connections.accepted_total],
-      ["refused (per-IP)", s.connections.refused_per_ip_total],
-      ["handshake timeouts", s.connections.handshake_timeouts],
-      ["auth failures", s.connections.auth_failures],
-      ["disconnects", s.connections.disconnects],
-    ]);
-    setKV("dns", [
-      ["enabled", s.dns.enabled],
-      ["entries", s.dns.entries + " / " + s.dns.max_entries],
-      ["ttl", s.dns.ttl_secs + "s"],
-      ["hits", s.dns.hits],
-      ["misses", s.dns.misses],
-      ["inserts", s.dns.inserts],
-      ["evictions", s.dns.evictions],
-      ["expired", s.dns.expired_dropped],
-    ]);
-    setKV("traffic", [
-      ["client → target", fmt(s.traffic.bytes_client_to_target) + " B"],
-      ["target → client", fmt(s.traffic.bytes_target_to_client) + " B"],
-      ["udp datagrams", s.traffic.udp_datagrams],
-      ["CONNECT", s.traffic.requests.connect],
-      ["BIND", s.traffic.requests.bind],
-      ["UDP ASSOCIATE", s.traffic.requests.udp_associate],
-    ]);
-    setKV("errors", s.errors.length
-      ? s.errors.map(e => [e.name, e.count])
-      : [["none", 0]]);
-    setRows("per-ip", 2, s.connections.active_per_ip.map(r => [r.ip, r.count]));
-    setRows("names", 2, s.dns.names.map(n => [n.name, n.expires_in_secs + "s"]));
-
-    const c = await (await fetch("/clients", { cache: "no-store" })).json();
-    setRows("clients", 7, c.map(cl => [
-      cl.id, cl.peer, cl.state, cl.command || "—",
-      fmt(cl.bytes_client_to_target) + "B", fmt(cl.bytes_target_to_client) + "B",
-      cl.elapsed_secs + "s",
-    ]));
-  } catch (e) {
-    setKV("errors", [["dashboard error", String(e.message || e)]]);
+function drawSpark() {
+  var canvas = document.getElementById("spark");
+  if (!canvas.getContext) { return; }
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  var max = 1;
+  for (var i = 0; i < activeHistory.length; i++) {
+    if (activeHistory[i] > max) { max = activeHistory[i]; }
   }
+  ctx.beginPath();
+  for (var j = 0; j < activeHistory.length; j++) {
+    var x = (j / (SPARK_LEN - 1)) * w;
+    var y = h - 2 - (activeHistory[j] / max) * (h - 4);
+    if (j === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+  }
+  ctx.strokeStyle = "#4fc3f7";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = "rgba(79, 195, 247, 0.12)";
+  ctx.fill();
+}
+async function tick() {
+  var now = Date.now();
+  var s, clients;
+  try {
+    var responses = await Promise.all([
+      fetch("/stats", { cache: "no-store" }).then(function (r) { return r.json(); }),
+      fetch("/clients", { cache: "no-store" }).then(function (r) { return r.json(); })
+    ]);
+    s = responses[0]; clients = responses[1];
+    document.getElementById("dot").className = "dot";
+  } catch (e) {
+    document.getElementById("dot").className = "dot off";
+    return;
+  }
+
+  activeHistory.push(s.connections.active);
+  activeHistory.shift();
+  drawSpark();
+
+  var rateUp = 0, rateDown = 0, delta = 0;
+  if (last.t) {
+    var dt = Math.max(1, (now - last.t) / 1000);
+    rateUp = Math.max(0, s.traffic.bytes_client_to_target - last.up) / dt;
+    rateDown = Math.max(0, s.traffic.bytes_target_to_client - last.down) / dt;
+    delta = Math.round((now - last.t) / 1000);
+  }
+  last = { up: s.traffic.bytes_client_to_target, down: s.traffic.bytes_target_to_client, t: now };
+
+  document.getElementById("meta").textContent =
+    "uptime " + fmtUptime(s.server.uptime_secs) +
+    " &middot; updated " + delta + "s ago" +
+    " &middot; v" + s.server.version;
+
+  setKV("server", [
+    ["listeners", s.server.listeners.join(", ") || "—"],
+    ["started", new Date(s.server.started_at_unix * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC"],
+  ]);
+  setKV("connections", [
+    ["active", s.connections.active],
+    ["accepted total", s.connections.accepted_total],
+    ["refused (per-IP)", s.connections.refused_per_ip_total],
+    ["handshake timeouts", s.connections.handshake_timeouts],
+    ["auth failures", s.connections.auth_failures],
+    ["disconnects", s.connections.disconnects],
+  ]);
+  setKV("dns", [
+    ["enabled", s.dns.enabled],
+    ["entries", s.dns.entries + " / " + s.dns.max_entries],
+    ["ttl", s.dns.ttl_secs + "s"],
+    ["hits", s.dns.hits],
+    ["misses", s.dns.misses],
+    ["inserts", s.dns.inserts],
+    ["evictions", s.dns.evictions],
+    ["expired", s.dns.expired_dropped],
+  ]);
+  setKV("traffic", [
+    ["client → target", fmtBytes(s.traffic.bytes_client_to_target)],
+    ["target → client", fmtBytes(s.traffic.bytes_target_to_client)],
+    ["rate up", fmtRate(rateUp)],
+    ["rate down", fmtRate(rateDown)],
+    ["udp datagrams", s.traffic.udp_datagrams],
+    ["CONNECT", s.traffic.requests.connect],
+    ["BIND", s.traffic.requests.bind],
+    ["UDP ASSOCIATE", s.traffic.requests.udp_associate],
+  ]);
+  setKV("errors", s.errors.length
+    ? s.errors.map(function (e) { return [e.name, e.count]; })
+    : [["none", 0]]);
+  setRows("per-ip", 2, s.connections.active_per_ip.map(function (r) { return [r.ip, r.count]; }));
+  setRows("names", 2, s.dns.names.map(function (n) { return [n.name, n.expires_in_secs + "s"]; }));
+  setRows("clients", 7, clients.map(function (cl) {
+    return [
+      cl.id, cl.peer, cl.state, cl.command || "—",
+      fmtBytes(cl.bytes_client_to_target), fmtBytes(cl.bytes_target_to_client),
+      cl.elapsed_secs + "s"
+    ];
+  }));
 }
 tick();
 setInterval(tick, 1000);
