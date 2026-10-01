@@ -28,12 +28,23 @@ pub struct ActiveGuard {
     stats: Arc<Stats>,
     ip: IpAddr,
     pub(crate) id: u64,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
 }
 
 impl ActiveGuard {
     /// Registry id of this connection, used to update its stats row.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Live byte counters for this connection, shared with the client row.
+    ///
+    /// The relay writes progress into these atomics as bytes move so an
+    /// in-flight connection's row keeps up; the aggregate totals still land
+    /// once relay finishes.
+    pub fn relay_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (Arc::clone(&self.bytes_up), Arc::clone(&self.bytes_down))
     }
 }
 
@@ -59,8 +70,8 @@ struct ClientRecord {
     local: Option<SocketAddr>,
     started_at: Instant,
     command: Option<&'static str>,
-    bytes_up: u64,
-    bytes_down: u64,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
 }
 
 /// Aggregate, always-on counters shared by every accept loop and connection.
@@ -175,17 +186,11 @@ impl Stats {
         }
     }
 
-    /// Add relayed bytes (client→target, target→client) and to the live row.
-    pub fn note_relay(&self, client_id: Option<u64>, up: u64, down: u64) {
+    /// Add relayed bytes (client→target, target→client) to the running totals.
+    pub fn note_relay(&self, up: u64, down: u64) {
         self.bytes_client_to_target.fetch_add(up, Ordering::Relaxed);
         self.bytes_target_to_client
             .fetch_add(down, Ordering::Relaxed);
-        if let Some(id) = client_id {
-            self.update_client(id, |record| {
-                record.bytes_up = record.bytes_up.saturating_add(up);
-                record.bytes_down = record.bytes_down.saturating_add(down);
-            });
-        }
     }
 
     /// Count one UDP datagram forwarded from a client.
@@ -214,6 +219,8 @@ impl Stats {
         local: Option<SocketAddr>,
     ) -> ActiveGuard {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let bytes_up = Arc::new(AtomicU64::new(0));
+        let bytes_down = Arc::new(AtomicU64::new(0));
         lock(&self.clients).insert(
             id,
             ClientRecord {
@@ -221,8 +228,8 @@ impl Stats {
                 local,
                 started_at: Instant::now(),
                 command: None,
-                bytes_up: 0,
-                bytes_down: 0,
+                bytes_up: Arc::clone(&bytes_up),
+                bytes_down: Arc::clone(&bytes_down),
             },
         );
         self.active.fetch_add(1, Ordering::Relaxed);
@@ -232,6 +239,8 @@ impl Stats {
             stats: Arc::clone(self),
             ip: peer.ip(),
             id,
+            bytes_up,
+            bytes_down,
         }
     }
 
@@ -251,8 +260,8 @@ impl Stats {
                     "negotiating"
                 },
                 command: record.command,
-                bytes_client_to_target: record.bytes_up,
-                bytes_target_to_client: record.bytes_down,
+                bytes_client_to_target: record.bytes_up.load(Ordering::Relaxed),
+                bytes_target_to_client: record.bytes_down.load(Ordering::Relaxed),
             })
             .collect();
         out.sort_by_key(|client| client.id);
@@ -502,7 +511,7 @@ mod tests {
         stats.note_refused_per_ip();
         stats.note_handshake_timeout();
         stats.note_auth_failure();
-        stats.note_relay(None, 100, 200);
+        stats.note_relay(100, 200);
         stats.note_error(0x05);
 
         let snap = stats.snapshot();
@@ -561,7 +570,9 @@ mod tests {
         assert_eq!(client.command, Some("connect"));
         assert_eq!(client.state, "relaying");
 
-        stats.note_relay(Some(guard.id), 5, 9);
+        let counters = guard.relay_counters();
+        counters.0.store(5, Ordering::Relaxed);
+        counters.1.store(9, Ordering::Relaxed);
         assert_eq!(stats.clients()[0].bytes_client_to_target, 5);
         assert_eq!(stats.clients()[0].bytes_target_to_client, 9);
     }

@@ -103,6 +103,31 @@ async fn active_per_ip_tracks_an_open_connection() {
         "expected a live client row with a command"
     );
 
+    // Bytes must be visible on the open connection, not only after it closes:
+    // the relay publishes progress every LIVE_RELAY_INTERVAL.
+    stream.write_all(&[0x55u8; 4096]).await.unwrap();
+    let mut echoed = vec![0u8; 4096];
+    timeout(IO_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let live = server.stats.clients();
+        if live
+            .iter()
+            .any(|client| client.bytes_client_to_target >= 4096)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "open relay never reported live bytes: {live:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     drop(stream);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while server.stats.snapshot().connections.active != 0 {

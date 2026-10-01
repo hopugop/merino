@@ -52,6 +52,19 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// immediately while still bailing out quickly when that path is blackholed.
 const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
+/// How often an in-flight relay publishes running byte totals to its stats row.
+///
+/// `copy_bidirectional` only returns its counts once both directions finish, so
+/// the live client view needs a periodic read to stay current. A quarter second
+/// keeps the dashboard responsive without turning the relay loop into a spin.
+const LIVE_RELAY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Size of each per-direction buffer in the counted relay.
+///
+/// Matches the 8 KiB default `tokio::io::copy_bidirectional` uses, so the
+/// instrumented relay moves the same amount of data per syscall as before.
+const RELAY_BUF_SIZE: usize = 8 * 1024;
+
 /// Default maximum number of client connections handled at once.
 ///
 /// Accepted connections beyond this limit wait in the accept loop until a
@@ -667,6 +680,91 @@ fn is_connection_failure(error: &MerinoError) -> bool {
     }
 }
 
+/// Relay bytes both ways while publishing running byte totals to `stats`.
+///
+/// `tokio::io::copy_bidirectional` only reports its counts after both
+/// directions finish, so an open relay's per-connection row would otherwise
+/// read zero until close. This drives the two directions itself with a shared
+/// running count and a timer that publishes it into `counters` as bytes move.
+async fn copy_bidirectional_counted<A, B>(
+    a: &mut A,
+    b: &mut B,
+    stats: Option<Arc<Stats>>,
+    counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let mut up_buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut down_buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut a_open = true;
+    let mut b_open = true;
+
+    let relay = async {
+        while a_open || b_open {
+            tokio::select! {
+                read = a.read(&mut up_buf), if a_open => {
+                    match read? {
+                        0 => { a_open = false; let _ = b.shutdown().await; }
+                        n => {
+                            b.write_all(up_buf.get(..n).unwrap_or(&[])).await?;
+                            b.flush().await?;
+                            progress.0.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+                read = b.read(&mut down_buf), if b_open => {
+                    match read? {
+                        0 => { b_open = false; let _ = a.shutdown().await; }
+                        n => {
+                            a.write_all(down_buf.get(..n).unwrap_or(&[])).await?;
+                            a.flush().await?;
+                            progress.1.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        io::Result::Ok(())
+    };
+    tokio::pin!(relay);
+
+    let publish = async {
+        match (&stats, &counters) {
+            (Some(_stats), Some(counters)) => {
+                let mut ticker = tokio::time::interval(LIVE_RELAY_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    counters
+                        .0
+                        .store(progress.0.load(Ordering::Relaxed), Ordering::Relaxed);
+                    counters
+                        .1
+                        .store(progress.1.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(publish);
+
+    tokio::select! {
+        result = &mut relay => result?,
+        _ = &mut publish => unreachable!("the progress ticker never completes"),
+    }
+
+    let up = progress.0.load(Ordering::Relaxed);
+    let down = progress.1.load(Ordering::Relaxed);
+    if let Some(counters) = &counters {
+        counters.0.store(up, Ordering::Relaxed);
+        counters.1.store(down, Ordering::Relaxed);
+    }
+    Ok((up, down))
+}
+
 /// Drive a single client connection to completion, replying with an error code
 /// and shutting the stream down when the SOCKS negotiation fails.
 pub(crate) async fn run_client<T>(
@@ -678,6 +776,7 @@ pub(crate) async fn run_client<T>(
 {
     let guard = stats.begin_client(client_addr, client.local_addr);
     client.client_id = Some(guard.id);
+    client.relay_counters = Some(guard.relay_counters());
     match client.init().await {
         Ok(_) => {}
         Err(error) => {
@@ -750,6 +849,9 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     /// Registry id assigned by `run_client`, used to update per-connection
     /// state in [`Stats`].
     client_id: Option<u64>,
+    /// Live relay-byte atomics for this connection, shared with its client row
+    /// so progress is visible before the relay finishes.
+    relay_counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
 }
 
 impl<T> SOCKClient<T>
@@ -799,6 +901,7 @@ where
             dns_cache: None,
             stats: None,
             client_id: None,
+            relay_counters: None,
         }
     }
 
@@ -822,6 +925,7 @@ where
             dns_cache: None,
             stats: None,
             client_id: None,
+            relay_counters: None,
         }
     }
 
@@ -1137,7 +1241,14 @@ where
                     .await?;
 
                 trace!("copy bidirectional");
-                match tokio::io::copy_bidirectional(&mut self.stream, &mut target).await {
+                match copy_bidirectional_counted(
+                    &mut self.stream,
+                    &mut target,
+                    self.stats.clone(),
+                    self.relay_counters.clone(),
+                )
+                .await
+                {
                     // ignore not connected for shutdown error
                     Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
                         trace!("already closed");
@@ -1146,7 +1257,7 @@ where
                     Err(e) => Err(MerinoError::Io(e)),
                     Ok((s_to_t, t_to_s)) => {
                         if let Some(stats) = self.stats.as_ref() {
-                            stats.note_relay(self.client_id, s_to_t, t_to_s);
+                            stats.note_relay(s_to_t, t_to_s);
                         }
                         Ok(t_to_s as usize)
                     }
@@ -1208,7 +1319,14 @@ where
             .await?;
 
         trace!("BIND relay");
-        match tokio::io::copy_bidirectional(&mut self.stream, &mut inbound).await {
+        match copy_bidirectional_counted(
+            &mut self.stream,
+            &mut inbound,
+            self.stats.clone(),
+            self.relay_counters.clone(),
+        )
+        .await
+        {
             Err(e) if e.kind() == io::ErrorKind::NotConnected => {
                 trace!("already closed");
                 Ok(0)
@@ -1216,7 +1334,7 @@ where
             Err(e) => Err(MerinoError::Io(e)),
             Ok((s_to_t, t_to_s)) => {
                 if let Some(stats) = self.stats.as_ref() {
-                    stats.note_relay(self.client_id, s_to_t, t_to_s);
+                    stats.note_relay(s_to_t, t_to_s);
                 }
                 Ok(t_to_s as usize)
             }

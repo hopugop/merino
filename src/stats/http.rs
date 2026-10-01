@@ -306,7 +306,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>merino live dashboard</title>
 <style>
-:root { color-scheme: dark; }
+:root { color-scheme: dark; --accent: #4fc3f7; }
 * { box-sizing: border-box; }
 body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 20px; background: #0f1115; color: #dfe3ea; }
 header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -326,20 +326,21 @@ th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #1f2630; }
 th { color: #8a93a3; font-weight: 500; }
 .empty { color: #6b7280; font-style: italic; }
 canvas { width: 100%; height: 64px; display: block; }
+.spark-meta { display: flex; justify-content: space-between; color: #8a93a3; font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
 <header>
   <span id="dot" class="dot"></span>
   <h1>&#128225; merino &mdash; live dashboard</h1>
-  <div class="sub" id="meta">connecting&#8230;</div>
+  <div class="sub" id="meta">connecting&hellip;</div>
 </header>
 <div class="grid">
   <div class="card"><h2>Server</h2><dl class="kv" id="server"></dl></div>
   <div class="card"><h2>Connections</h2><dl class="kv" id="connections"></dl></div>
   <div class="card"><h2>DNS cache</h2><dl class="kv" id="dns"></dl></div>
   <div class="card"><h2>Traffic</h2><dl class="kv" id="traffic"></dl></div>
-  <div class="card"><h2>Active connections</h2><canvas id="spark" width="600" height="64"></canvas></div>
+  <div class="card"><h2>Active connections</h2><canvas id="spark" width="600" height="64"></canvas><div class="spark-meta"><span id="spark-min">min 0</span><span id="spark-max">max 0</span></div></div>
   <div class="card"><h2>Errors</h2><dl class="kv" id="errors"></dl></div>
   <div class="card"><h2>Active per IP</h2><table id="per-ip"><tbody></tbody></table></div>
   <div class="card"><h2>Cached names</h2><table id="names"><tbody></tbody></table></div>
@@ -355,7 +356,12 @@ function fmtBytes(n) {
   var units = ["B", "kB", "MB", "GB", "TB"];
   var i = 0;
   while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
-  return (i === 0 ? String(n) : n.toFixed(1)) + " " + units[i];
+  var v;
+  if (i < 2) { v = String(Math.round(n)); }
+  else if (n < 10) { v = n.toFixed(2); }
+  else if (n < 100) { v = n.toFixed(1); }
+  else { v = String(Math.round(n)); }
+  return v + " " + units[i];
 }
 function fmtRate(bps) {
   if (bps < 1) { return "0 B/s"; }
@@ -408,22 +414,32 @@ function drawSpark() {
   var ctx = canvas.getContext("2d");
   var w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
-  var max = 1;
-  for (var i = 0; i < activeHistory.length; i++) {
-    if (activeHistory[i] > max) { max = activeHistory[i]; }
+  var lo = activeHistory[0], hi = activeHistory[0];
+  for (var i = 1; i < activeHistory.length; i++) {
+    if (activeHistory[i] < lo) { lo = activeHistory[i]; }
+    if (activeHistory[i] > hi) { hi = activeHistory[i]; }
   }
+  var pad = (hi - lo) * 0.15;
+  var ymin = Math.max(0, lo - pad);
+  var ymax = hi + pad;
+  if (ymax - ymin < 0.0001) { ymax = ymin + 1; }
+  var span = ymax - ymin;
+  var colors = window.getComputedStyle(document.body);
+  var line = colors.getPropertyValue("--accent").trim() || "#4fc3f7";
   ctx.beginPath();
   for (var j = 0; j < activeHistory.length; j++) {
     var x = (j / (SPARK_LEN - 1)) * w;
-    var y = h - 2 - (activeHistory[j] / max) * (h - 4);
+    var y = h - 2 - ((activeHistory[j] - ymin) / span) * (h - 4);
     if (j === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
   }
-  ctx.strokeStyle = "#4fc3f7";
+  ctx.strokeStyle = line;
   ctx.lineWidth = 1.5;
   ctx.stroke();
   ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
   ctx.fillStyle = "rgba(79, 195, 247, 0.12)";
   ctx.fill();
+  document.getElementById("spark-min").textContent = "min " + lo;
+  document.getElementById("spark-max").textContent = "max " + hi;
 }
 async function tick() {
   var now = Date.now();
@@ -455,8 +471,8 @@ async function tick() {
 
   document.getElementById("meta").textContent =
     "uptime " + fmtUptime(s.server.uptime_secs) +
-    " &middot; updated " + delta + "s ago" +
-    " &middot; v" + s.server.version;
+    " \u00b7 updated " + delta + "s ago" +
+    " \u00b7 v" + s.server.version;
 
   setKV("server", [
     ["listeners", s.server.listeners.join(", ") || "—"],

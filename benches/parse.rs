@@ -192,7 +192,9 @@ fn bench_stats_core(c: &mut Criterion) {
         b.iter(|| {
             let guard = stats.begin_client(peer, None);
             stats.note_request(Some(guard.id()), SockCommand::Connect);
-            stats.note_relay(Some(guard.id()), 8192, 8192);
+            let counters = guard.relay_counters();
+            counters.0.store(8192, std::sync::atomic::Ordering::Relaxed);
+            counters.1.store(8192, std::sync::atomic::Ordering::Relaxed);
             drop(guard);
         });
     });
